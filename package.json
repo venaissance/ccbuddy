@@ -1,0 +1,27 @@
+{
+  "name": "openclaw",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "test": "bun test --cwd . tests/",
+    "test:watch": "bun test --cwd . --watch tests/",
+    "test:ci": "bun test --cwd . --ci tests/",
+    "lint": "bunx --bun @biomejs/biome check --write src/ tests/",
+    "typecheck": "bunx --bun tsc --noEmit"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.60.0",
+    "drizzle-orm": "^0.45.0",
+    "hono": "^4.7.0",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/bun": "latest",
+    "@types/node-cron": "^3.0.11",
+    "drizzle-kit": "^0.31.0",
+    "typescript": "^5.7.0"
+  }
+}

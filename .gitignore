@@ -1,0 +1,13 @@
+node_modules/
+dist/
+data/
+.env
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+web/dist/
+docs/private/
+.superpowers/
+scripts/
+package-lock.json
