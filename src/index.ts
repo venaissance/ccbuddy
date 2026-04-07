@@ -13,7 +13,7 @@ import { createSessionManager } from "./session";
 // ── Config ──────────────────────────────────────────
 
 const PORT = Number(process.env.PORT || 3000);
-const DB_PATH = "./data/openclaw.db";
+const DB_PATH = "./data/ccbuddy.db";
 const SESSIONS_DIR = "./data/sessions";
 const MEMORY_DIR = "./data/memory";
 
@@ -115,7 +115,7 @@ async function main() {
   initCron(runAgent);
   console.log("[init] Cron scheduler started");
 
-  console.log("OpenClaw daemon started");
+  console.log("CCBuddy daemon started");
 
   // Graceful shutdown
   process.on("SIGINT", () => {

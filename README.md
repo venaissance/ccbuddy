@@ -75,29 +75,35 @@ Three IO channels, one process: **HTTP** (dashboard + API), **WebSocket** (Feish
 # Clone
 git clone <repo-url> ccbuddy && cd ccbuddy
 
-# Install dependencies
+# One-command setup (install deps, configure, start PM2)
+bash scripts/setup.sh
+```
+
+Or step by step:
+
+```bash
 bun install
+cp .env.example .env          # then edit with your Feishu credentials
+cp ecosystem.config.example.cjs ecosystem.config.cjs
 
-# Configure environment
-cp .env.example .env
-# Edit .env with your credentials:
-#   FEISHU_APP_ID=cli_xxxxxxxxxxxx
-#   FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxx
-#   PORT=3001  (optional, defaults to 3000)
-
-# Run (development, with hot reload)
+# Development (hot reload)
 bun run dev
 
-# Run (production)
-bun run start
+# Production (PM2 daemon)
+pm2 start ecosystem.config.cjs
 ```
 
 The server starts on `http://localhost:3000`. The dashboard is served at the root path.
 
-### Production with PM2
+### Preflight (optional)
+
+The PM2 entry point (`scripts/start.sh`) looks for a preflight script at `~/.claude/hooks/preflight.sh` before launching CCBuddy. If found, it runs the script and aborts on failure. This is useful for environment checks (e.g. network connectivity, required services). If no preflight script exists, it is skipped silently.
+
+### Auto-start on boot
 
 ```bash
-pm2 start ecosystem.config.cjs
+pm2 startup       # prints a sudo command — run it
+pm2 save           # persist process list
 ```
 
 ## How It Works
@@ -155,13 +161,16 @@ src/
   api.ts            Hono REST routes: sessions, tasks, logs, memory
   cron.ts           Heartbeat scheduler with concurrency guard
 
+scripts/
+  setup.sh          One-command install and PM2 setup
+  start.sh          PM2 entry point (preflight + bun)
 web/                React dashboard (Vite + React)
 tests/              169 tests across 11 files
   unit/             8 files — agent, API, cron, DB, feishu-auth, feishu-ws, memory, session
   integration/      2 files — API E2E, message pipeline
   e2e/              1 file  — server lifecycle
 data/               Runtime data (gitignored)
-  openclaw.db       SQLite database
+  ccbuddy.db        SQLite database
   sessions/         JSONL message files
   memory/           SOUL.md, USER.md, topics/
 ```

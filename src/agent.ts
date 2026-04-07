@@ -147,7 +147,7 @@ export async function runAgent(options: AgentOptions): Promise<void> {
   const proc = spawn("claude", args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "openclaw" },
+    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "ccbuddy" },
   });
 
   trackProcess(sessionId, proc);

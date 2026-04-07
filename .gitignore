@@ -9,5 +9,6 @@ data/
 web/dist/
 docs/private/
 .superpowers/
-scripts/
+scripts/test-*.ts
 package-lock.json
+ecosystem.config.cjs

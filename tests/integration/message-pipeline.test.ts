@@ -21,7 +21,7 @@ let db: any;
 // ── Setup / Teardown ───────────────────────────────
 
 beforeEach(async () => {
-  TEST_DIR = await mkdtemp(join(tmpdir(), "openclaw-pipeline-"));
+  TEST_DIR = await mkdtemp(join(tmpdir(), "ccbuddy-pipeline-"));
   TEST_DB_PATH = join(TEST_DIR, "test.db");
   TEST_SESSIONS_DIR = join(TEST_DIR, "sessions");
 
