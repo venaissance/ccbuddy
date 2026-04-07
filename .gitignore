@@ -10,5 +10,6 @@ web/dist/
 docs/private/
 .superpowers/
 scripts/test-*.ts
+scripts/test-*.sh
 package-lock.json
 ecosystem.config.cjs
