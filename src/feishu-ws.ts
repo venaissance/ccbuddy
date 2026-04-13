@@ -45,6 +45,30 @@ export function getLarkClient() {
 
 // ── WebSocket Init ──────────────────────────────────
 
+// ── Card Action Callbacks ──────────────────────────
+
+type CardActionCallback = (action: CardAction) => object | Promise<object | void> | void;
+
+export interface CardAction {
+  actionTag: string;
+  actionValue: Record<string, string>;
+  chatId: string;
+  userId: string;
+}
+
+const cardActionCallbacks = new Map<string, CardActionCallback>();
+
+/**
+ * Register a handler for card button clicks.
+ * The actionTag matches the button's `name` field in the card JSON.
+ * Return an updated card object to replace the current card, or void to keep it.
+ */
+export function onCardAction(actionTag: string, handler: CardActionCallback): void {
+  cardActionCallbacks.set(actionTag, handler);
+}
+
+// ── WebSocket Init ──────────────────────────────────
+
 export async function initFeishuWS(config: {
   appId: string;
   appSecret: string;
@@ -84,7 +108,49 @@ export async function initFeishuWS(config: {
         console.error("[feishu] Error handling message:", err);
       }
     },
-  });
+    "card.action.trigger": async (data: any) => {
+      try {
+        const action = data?.event?.action || data?.action;
+        const context = data?.event?.context || data?.context;
+        const operator = data?.event?.operator || data?.operator;
+        if (!action) {
+          console.log(`[feishu] Card action: no action in data, keys=${Object.keys(data || {})}`);
+          return;
+        }
+
+        const value = action.value || {};
+        const actionName = value.action || "";
+        const chatId = context?.open_chat_id || "";
+        const messageId = context?.open_message_id || "";
+        const userId = operator?.open_id || "";
+
+        console.log(`[feishu] Card action: ${actionName} value=${JSON.stringify(value)}`);
+
+        const handler = cardActionCallbacks.get(actionName);
+        if (handler) {
+          const result = await handler({ actionTag: actionName, actionValue: value, chatId, userId });
+          if (!result) return;
+
+          const { card: updatedCard, toastText } = result as { card?: any; toastText?: string };
+
+          // Build callback response per Feishu spec:
+          // { card: { type: "raw", data: cardJson }, toast: { type, content } }
+          const response: any = {};
+          if (updatedCard) {
+            response.card = { type: "raw", data: updatedCard };
+          }
+          if (toastText) {
+            response.toast = { type: "success", content: toastText };
+          }
+
+          console.log(`[feishu] Card action response: toast=${toastText || "none"}, hasCard=${!!updatedCard}`);
+          return response;
+        }
+      } catch (err) {
+        console.error("[feishu] Error handling card action:", err);
+      }
+    },
+  } as any);
 
   const wsClient = new lark.WSClient({
     appId: config.appId,
@@ -127,25 +193,47 @@ const STATUS_ELEMENT_ID = "status_note";
 export class StreamingCard {
   private cardId: string | null = null;
   private messageId: string | null = null;
+  private replyToMsgId: string | null = null;
   private sequence = 0;
   private lastContentHash = "";
   private lastFlush = 0;
-  private debounceMs: number;
+  private lastFlushedLen = 0;
+  private minInterval: number;
+  private minDelta: number;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
   private text = "";
   private useFallback = false;
+  private state: "idle" | "creating" | "streaming" | "done" = "idle";
+  private thinkingStartedAt = 0;
+  private thinkingTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(debounceMs = 300) {
-    this.debounceMs = debounceMs;
+  constructor(minInterval = 300, minDelta = 30) {
+    this.minInterval = minInterval;
+    this.minDelta = minDelta;
   }
 
   private nextSeq(): number {
     return ++this.sequence;
   }
 
-  /** Step 1: Create card + send as reply. Call once. */
+  /** Step 0: Register reply target. Card is created lazily on first content. */
   async create(replyToMsgId: string): Promise<void> {
-    if (!larkClient) return;
+    this.replyToMsgId = replyToMsgId;
+  }
+
+  /** Called when thinking starts — lazily creates card with thinking indicator. */
+  async setThinking(): Promise<void> {
+    this.thinkingStartedAt = Date.now();
+    if (this.state === "idle") {
+      await this.createCardNow("💭 思考中...", "");
+    }
+  }
+
+  /** Actually create the card (called lazily from setThinking or pushContent). */
+  private async createCardNow(headerText: string, initialContent: string): Promise<void> {
+    if (!larkClient || !this.replyToMsgId || this.state !== "idle") return;
+    this.state = "creating";
 
     const cardJson = {
       schema: "2.0",
@@ -159,19 +247,18 @@ export class StreamingCard {
         },
       },
       header: {
-        title: { tag: "plain_text", content: "💭 思考中..." },
+        title: { tag: "plain_text", content: headerText },
         template: "wathet",
       },
       body: {
         elements: [
-          { tag: "markdown", content: "...", element_id: MAIN_ELEMENT_ID },
+          { tag: "markdown", content: initialContent || "...", element_id: MAIN_ELEMENT_ID },
           { tag: "markdown", content: "⏳ 生成中...", element_id: STATUS_ELEMENT_ID, text_size: "notation" },
         ],
       },
     };
 
     try {
-      // Create CardKit card
       const createResp = await larkClient.cardkit.v1.card.create({
         data: { type: "card_json", data: JSON.stringify(cardJson) },
       });
@@ -179,41 +266,98 @@ export class StreamingCard {
       if (!this.cardId) throw new Error("No card_id returned");
       this.sequence = 1;
 
-      // Send as reply message
       const sendResp = await larkClient.im.message.reply({
-        path: { message_id: replyToMsgId },
+        path: { message_id: this.replyToMsgId },
         data: {
           msg_type: "interactive",
           content: JSON.stringify({ type: "card", data: { card_id: this.cardId } }),
         },
       });
       this.messageId = sendResp?.data?.message_id || null;
+      this.state = "streaming";
       console.log(`[card] Created streaming card ${this.cardId}`);
     } catch (err) {
       console.warn("[card] CardKit unavailable, falling back to message.patch");
       this.useFallback = true;
-      // Fallback: create plain interactive card
-      await this.createFallback(replyToMsgId);
+      await this.createFallback();
+      this.state = "streaming";
     }
   }
 
   /** Fallback: create card via im.message.reply (no streaming_mode) */
-  private async createFallback(replyToMsgId: string): Promise<void> {
+  private async createFallback(): Promise<void> {
+    if (!this.replyToMsgId) return;
     const card = buildSimpleCard("...", "streaming");
     const resp = await larkClient.im.message.reply({
-      path: { message_id: replyToMsgId },
+      path: { message_id: this.replyToMsgId },
       data: { msg_type: "interactive", content: JSON.stringify(card) },
     });
     this.messageId = resp?.data?.message_id || null;
   }
 
-  /** Step 2: Push text content. Debounced, call repeatedly. */
+  /** Step 2: Push text content. Lazily creates card if needed. Smart flush. */
   async pushContent(fullText: string): Promise<void> {
+    // Lazy card creation on first text
+    if (this.state === "idle") {
+      const elapsed = this.thinkingStartedAt ? `${((Date.now() - this.thinkingStartedAt) / 1000).toFixed(1)}s` : "";
+      await this.createCardNow(elapsed ? `✍️ 生成中 (思考 ${elapsed})` : "✍️ 生成中...", fullText);
+      this.text = fullText;
+      this.lastFlushedLen = fullText.length;
+      this.lastFlush = Date.now();
+      // Stop thinking timer
+      if (this.thinkingTimer) { clearInterval(this.thinkingTimer); this.thinkingTimer = null; }
+      return;
+    }
+
+    // Wait for card creation to finish
+    if (this.state === "creating") {
+      this.text = fullText;
+      this.dirty = true;
+      return;
+    }
+
+    // Update header on first text after thinking
+    if (this.thinkingStartedAt && this.cardId && larkClient && !this.useFallback) {
+      const elapsed = ((Date.now() - this.thinkingStartedAt) / 1000).toFixed(1);
+      this.thinkingStartedAt = 0; // Only once
+      try {
+        await larkClient.cardkit.v1.card.update({
+          path: { card_id: this.cardId },
+          data: {
+            card: { type: "card_json", data: JSON.stringify({
+              schema: "2.0",
+              config: { wide_screen_mode: true, streaming_mode: true,
+                streaming_config: { print_frequency_ms: { default: 50 }, print_step: { default: 2 }, print_strategy: "fast" } },
+              header: { title: { tag: "plain_text", content: `✍️ 生成中 (思考 ${elapsed}s)` }, template: "wathet" },
+              body: { elements: [
+                { tag: "markdown", content: fullText || "...", element_id: MAIN_ELEMENT_ID },
+                { tag: "markdown", content: "⏳ 生成中...", element_id: STATUS_ELEMENT_ID, text_size: "notation" },
+              ] },
+            }) },
+            sequence: this.nextSeq(),
+          },
+        });
+      } catch { /* non-critical */ }
+    }
+
     this.text = fullText;
     this.dirty = true;
 
-    if (Date.now() - this.lastFlush < this.debounceMs) return;
-    await this.flush();
+    const newChars = fullText.length - this.lastFlushedLen;
+    const elapsed = Date.now() - this.lastFlush;
+
+    if (newChars >= this.minDelta && elapsed >= this.minInterval) {
+      if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+      await this.flush();
+      return;
+    }
+
+    if (!this.flushTimer) {
+      this.flushTimer = setTimeout(async () => {
+        this.flushTimer = null;
+        await this.flush();
+      }, this.minInterval);
+    }
   }
 
   /** Force flush current content. */
@@ -221,6 +365,7 @@ export class StreamingCard {
     if (!this.dirty) return;
     this.dirty = false;
     this.lastFlush = Date.now();
+    this.lastFlushedLen = this.text.length;
 
     if (this.useFallback) {
       await this.flushFallback("streaming");
@@ -260,11 +405,25 @@ export class StreamingCard {
   }
 
   /** Step 3: Finalize card — disable streaming, set completed state. */
-  async complete(finalText: string): Promise<void> {
+  async complete(finalText: string, statusline?: string): Promise<void> {
+    if (this.thinkingTimer) { clearInterval(this.thinkingTimer); this.thinkingTimer = null; }
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+    this.state = "done";
     this.text = finalText;
 
+    // If card was never created, create it now with final content
+    if (!this.cardId && !this.messageId) {
+      if (!this.replyToMsgId || !larkClient) return;
+      const card = buildSimpleCard(finalText || "（无输出）", "completed", statusline);
+      await larkClient.im.message.reply({
+        path: { message_id: this.replyToMsgId },
+        data: { msg_type: "interactive", content: JSON.stringify(card) },
+      });
+      return;
+    }
+
     if (this.useFallback) {
-      await this.flushFallback("completed");
+      await this.flushFallback("completed", statusline);
       return;
     }
 
@@ -280,6 +439,19 @@ export class StreamingCard {
         },
       });
 
+      // Build final elements
+      const elements: any[] = [
+        { tag: "markdown", content: finalText, element_id: MAIN_ELEMENT_ID },
+      ];
+
+      if (statusline) {
+        elements.push({
+          tag: "markdown",
+          content: statusline,
+          text_size: "notation",
+        });
+      }
+
       // Update to final state
       const finalCard = {
         schema: "2.0",
@@ -288,11 +460,7 @@ export class StreamingCard {
           title: { tag: "plain_text", content: "✅ 回复" },
           template: "indigo",
         },
-        body: {
-          elements: [
-            { tag: "markdown", content: finalText, element_id: MAIN_ELEMENT_ID },
-          ],
-        },
+        body: { elements },
       };
 
       await larkClient.cardkit.v1.card.update({
@@ -305,9 +473,8 @@ export class StreamingCard {
       console.log(`[card] Completed ${this.cardId}`);
     } catch (err: any) {
       console.error("[card] Complete failed:", err?.message);
-      // Last resort: try fallback
       this.useFallback = true;
-      await this.flushFallback("completed");
+      await this.flushFallback("completed", statusline);
     }
   }
 
@@ -381,10 +548,10 @@ export class StreamingCard {
   }
 
   /** Fallback: update card via im.message.patch */
-  private async flushFallback(state: "streaming" | "completed" | "error"): Promise<void> {
+  private async flushFallback(state: "streaming" | "completed" | "error", statusline?: string): Promise<void> {
     if (!this.messageId || !larkClient) return;
     try {
-      const card = buildSimpleCard(this.text, state);
+      const card = buildSimpleCard(this.text, state, statusline);
       await larkClient.im.message.patch({
         path: { message_id: this.messageId },
         data: { content: JSON.stringify(card) },
@@ -399,7 +566,7 @@ export class StreamingCard {
 
 // ── Simple Card Builder (for fallback) ──────────────
 
-function buildSimpleCard(text: string, state: "streaming" | "completed" | "error"): object {
+function buildSimpleCard(text: string, state: "streaming" | "completed" | "error", statusline?: string): object {
   const headerMap = {
     streaming: { template: "wathet", title: "💭 思考中..." },
     completed: { template: "indigo", title: "✅ 回复" },
@@ -410,6 +577,9 @@ function buildSimpleCard(text: string, state: "streaming" | "completed" | "error
   if (text) elements.push({ tag: "markdown", content: text });
   if (state === "streaming") {
     elements.push({ tag: "note", elements: [{ tag: "plain_text", content: "⏳ 生成中..." }] });
+  }
+  if (state === "completed" && statusline) {
+    elements.push({ tag: "markdown", content: statusline, text_size: "notation" });
   }
   return {
     config: { wide_screen_mode: true },

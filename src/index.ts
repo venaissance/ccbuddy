@@ -8,7 +8,9 @@ import { initCron } from "./cron";
 import { runAgent } from "./agent";
 import { initFeishuWS, addReaction, StreamingCard } from "./feishu-ws";
 import { isAuthCommand, handleAuth } from "./feishu-auth";
+import { parseCommand, executeCommand, buildStatusline, initCardActions } from "./commands";
 import { createSessionManager } from "./session";
+import { initUsageTracker, recordUsage } from "./usage";
 
 // ── Config ──────────────────────────────────────────
 
@@ -29,8 +31,9 @@ async function main() {
   await initMemory(MEMORY_DIR);
   console.log("[init] Memory initialized");
 
-  // 3. Create session manager
+  // 3. Create session manager + usage tracker
   const sessions = createSessionManager(db, sqlite, SESSIONS_DIR);
+  initUsageTracker(sqlite);
 
   // 4. Setup HTTP server
   const app = new Hono();
@@ -54,18 +57,32 @@ async function main() {
           return;
         }
 
+        // 0.5 Handle slash commands — intercept before agent
+        const sessionKey = chatId || threadId;
+        const cmd = parseCommand(text);
+        if (cmd) {
+          addReaction(messageId, "Done");
+          const session = await sessions.getOrCreateSession(sessionKey, senderId);
+          await executeCommand(cmd.name, {
+            sessionId: session.id,
+            messageId,
+            chatId,
+            args: cmd.args,
+          });
+          return;
+        }
+
         // 1. Instant reaction — zero-latency feedback
         addReaction(messageId, "OnIt");
 
         // Use chatId as session key — all messages in same chat share context
         // Falls back to threadId for thread replies
-        const sessionKey = chatId || threadId;
         const session = await sessions.getOrCreateSession(sessionKey, senderId);
         await sessions.appendMessage(session.id, { role: "user", content: text });
         await sessions.updateStatus(session.id, "active");
 
-        // 2. Create ONE streaming card (typewriter effect)
-        const card = new StreamingCard(300);
+        // 2. Create streaming card (lazy — actually created on first stream event)
+        const card = new StreamingCard(300, 30);
         await card.create(messageId);
 
         let fullText = "";
@@ -74,14 +91,22 @@ async function main() {
           sessionId: session.id,
           prompt: text,
           onStream: async (chunk) => {
-            if (chunk.type === "assistant" && chunk.content) {
+            if (chunk.type === "thinking") {
+              await card.setThinking();
+            } else if (chunk.type === "assistant" && chunk.content) {
               fullText += chunk.content;
               await card.pushContent(fullText);
             }
           },
-          onEnd: async () => {
-            // Flush remaining + switch to completed state (same card!)
-            await card.complete(fullText || "（无输出）");
+          onEnd: async (result) => {
+            // Persist usage to SQLite (survives restarts)
+            const inTokens = result.usage.inputTokens + result.usage.cacheCreationTokens + result.usage.cacheReadTokens;
+            recordUsage(inTokens, result.usage.outputTokens, result.cost);
+
+            // Flush remaining + switch to completed state with statusline
+            const statusline = buildStatusline(session.id, result.cost, result.usage);
+            console.log(`[agent] Statusline: ${statusline || "(empty)"}`);
+            await card.complete(fullText || "（无输出）", statusline);
             await sessions.appendMessage(session.id, {
               role: "assistant",
               content: fullText,
@@ -99,6 +124,11 @@ async function main() {
           },
         });
       },
+    });
+    // Register card action handlers (model/effort button clicks)
+    initCardActions(async (chatId: string) => {
+      const session = await sessions.getOrCreateSession(chatId, "");
+      return session.id;
     });
     console.log("[init] Feishu WebSocket connected");
     } catch (err: any) {

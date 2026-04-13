@@ -12,11 +12,13 @@ CCBuddy runs as a single Bun process that connects to Feishu via WebSocket, spaw
 
 ## Features
 
-- **Streaming replies** -- CardKit-based typewriter effect with debounced updates, automatic fallback to message.patch
-- **Feishu WebSocket** -- Persistent long connection, no webhook server needed, handles text and rich-text messages
+- **Streaming replies** -- Token-level streaming via `--include-partial-messages`, smart FlushController (300ms + 30 char threshold), lazy card creation on first content, thinking state display
+- **Slash commands** -- `/model` (interactive card with model + effort picker), `/cost` (usage stats in ¥), `/new`, `/stop`, `/compact`, `/context`, `/status`, `/help`
+- **Usage tracking** -- Per-turn token counts, API-equivalent cost in CNY, persistent historical totals in SQLite, rate limit reset countdowns
+- **Feishu WebSocket** -- Persistent long connection, no webhook server needed, card action callbacks (`card.action.trigger`)
 - **Three-layer memory** -- SOUL (personality) + USER (profile) + topics (keyword-recalled per conversation)
 - **Heartbeat cron** -- Triggers the agent every 30 minutes; the agent decides autonomously what to do
-- **Session management** -- Per-chat sessions with JSONL message history and SQLite metadata
+- **Session management** -- Per-chat sessions with JSONL message history and SQLite metadata, model/effort per session
 - **OAuth Device Flow** -- `/auth` command for user-scoped Feishu API access (calendar, tasks, docs)
 - **Two-layer skills** -- Project-level and global skills loaded by Claude Code from `CLAUDE.md`
 - **React dashboard** -- Web UI for sessions, tasks, logs, and memory inspection
@@ -112,14 +114,15 @@ pm2 save           # persist process list
 
 ```
 User sends message on Feishu
-  -> Feishu WebSocket delivers event
-    -> extractText() parses text/post content
-      -> addReaction("OnIt") for instant feedback
-        -> getOrCreateSession() by chat ID
-          -> spawn `claude` CLI with --output-format stream-json
-            -> parse NDJSON stream line by line
-              -> StreamingCard.pushContent() (debounced, typewriter)
-                -> StreamingCard.complete() on finish
+  -> WebSocket event
+    -> /auth, /model, /cost...? → slash command handler (direct reply)
+    -> normal message:
+      -> addReaction("OnIt")
+      -> spawn claude CLI (--include-partial-messages --model --effort)
+        -> thinking_delta → lazy create card "💭 思考中..."
+        -> text_delta → accumulate + smart flush to CardKit
+        -> result → record tokens/cost to SQLite, build statusline
+        -> card.complete() with statusline footer
 ```
 
 ### Memory System
@@ -152,9 +155,11 @@ This grants user-scoped access to calendar, tasks, docs, contacts, and messages.
 ```
 src/
   index.ts          Bootstrap: DB, memory, HTTP, WebSocket, cron
-  agent.ts          Spawn Claude CLI, parse NDJSON stream, manage processes
-  feishu-ws.ts      WebSocket init, text extraction, StreamingCard (CardKit)
+  agent.ts          Spawn Claude CLI, parse NDJSON stream, manage processes, SessionMeta
+  commands.ts       Slash commands (/model, /cost, /new, /stop...), statusline builder
+  feishu-ws.ts      WebSocket init, text extraction, StreamingCard (CardKit), card actions
   feishu-auth.ts    OAuth Device Flow via lark-cli
+  usage.ts          Persistent usage tracking (SQLite), cost formatting (CNY)
   session.ts        Session CRUD, JSONL message append
   memory.ts         Three-layer memory: SOUL, USER, topic recall
   db.ts             SQLite schema (Drizzle ORM), WAL mode
@@ -164,6 +169,7 @@ src/
 scripts/
   setup.sh          One-command install and PM2 setup
   start.sh          PM2 entry point (preflight + bun)
+  claude-wrapper.sh Proxy preflight check wrapper (optional)
 web/                React dashboard (Vite + React)
 tests/              169 tests across 11 files
   unit/             8 files — agent, API, cron, DB, feishu-auth, feishu-ws, memory, session

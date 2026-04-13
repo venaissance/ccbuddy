@@ -75,6 +75,17 @@ export async function initDB(sqlite: Database) {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS usage_stats (
+      id TEXT PRIMARY KEY DEFAULT 'global',
+      total_input_tokens INTEGER NOT NULL DEFAULT 0,
+      total_output_tokens INTEGER NOT NULL DEFAULT 0,
+      total_cost_usd REAL NOT NULL DEFAULT 0,
+      total_turns INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+
+    INSERT OR IGNORE INTO usage_stats (id, updated_at) VALUES ('global', 0);
+
     CREATE INDEX IF NOT EXISTS idx_sessions_thread ON sessions(thread_id);
     CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
   `);
