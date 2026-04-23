@@ -1,3 +1,5 @@
+import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { serve } from "bun";
@@ -5,6 +7,7 @@ import { createDB, initDB } from "./db";
 import { registerRoutes } from "./api";
 import { initMemory } from "./memory";
 import { initCron } from "./cron";
+import { initDailyReport } from "./daily-report";
 import { runAgent } from "./agent";
 import { initFeishuWS, addReaction, StreamingCard } from "./feishu-ws";
 import { isAuthCommand, handleAuth } from "./feishu-auth";
@@ -21,7 +24,40 @@ const MEMORY_DIR = "./data/memory";
 
 // ── Bootstrap ───────────────────────────────────────
 
+/**
+ * Create all runtime data directories up-front. Fresh installs / PM2 after
+ * `rm -rf data/` would otherwise ENOENT during first write (session append,
+ * memory recall, daily-report JSON, WAL checkpoint).
+ */
+async function ensureDataDirs() {
+  await mkdir(dirname(DB_PATH), { recursive: true });
+  await mkdir(SESSIONS_DIR, { recursive: true });
+  await mkdir(MEMORY_DIR, { recursive: true });
+  await mkdir(join(MEMORY_DIR, "topics"), { recursive: true });
+  await mkdir(join(dirname(DB_PATH), "daily-report"), { recursive: true });
+}
+
+/**
+ * Keep the process alive through transient async errors (stale card updates
+ * during WS reconnect, Feishu API 5xx, agent subprocess glitches). Log and
+ * move on — persistent problems surface via the WS supervisor liveness probe.
+ */
+function installProcessErrorHandlers() {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[unhandledRejection]", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException]", err);
+  });
+}
+
 async function main() {
+  installProcessErrorHandlers();
+
+  // 0. Ensure data directories exist before any IO
+  await ensureDataDirs();
+  console.log("[init] Data dirs ready");
+
   // 1. Init database
   const { db, sqlite } = createDB(DB_PATH);
   await initDB(sqlite);
@@ -144,6 +180,9 @@ async function main() {
   // 6. Start cron scheduler
   initCron(runAgent);
   console.log("[init] Cron scheduler started");
+
+  // 7. Daily report scheduler (independent from heartbeat)
+  initDailyReport(runAgent);
 
   console.log("CCBuddy daemon started");
 

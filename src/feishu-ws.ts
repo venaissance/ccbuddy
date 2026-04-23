@@ -38,9 +38,17 @@ function flattenPostContent(content: any): string {
 // ── Feishu Client ───────────────────────────────────
 
 let larkClient: any = null;
+let wsClientRef: any = null;
+let currentEventDispatcher: any = null;
+let currentWsConfig: { appId: string; appSecret: string } | null = null;
+let supervisorStarted = false;
 
 export function getLarkClient() {
   return larkClient;
+}
+
+export function getWsClient() {
+  return wsClientRef;
 }
 
 // ── WebSocket Init ──────────────────────────────────
@@ -152,13 +160,106 @@ export async function initFeishuWS(config: {
     },
   } as any);
 
-  const wsClient = new lark.WSClient({
-    appId: config.appId,
-    appSecret: config.appSecret,
-  });
+  currentEventDispatcher = eventDispatcher;
+  currentWsConfig = { appId: config.appId, appSecret: config.appSecret };
 
-  await wsClient.start({ eventDispatcher });
-  return { client: larkClient, wsClient };
+  await createAndStartWs(lark);
+
+  if (!supervisorStarted) {
+    supervisorStarted = true;
+    void runNetworkSupervisor(lark);
+  }
+
+  return { client: larkClient, wsClient: wsClientRef };
+}
+
+// ── WS rebuild + network supervisor ─────────────────
+//
+// Feishu SDK's autoReconnect is bounded by server-provided `reconnectCount`
+// (observed: 4 retries) and has no public "gave up" event. After exhausting
+// retries, the WSClient goes silent but the process stays up — PM2 has no
+// way to notice. To survive long network outages (WiFi drop, VPN hiccup,
+// laptop sleep), we probe Feishu HTTP every 30s and rebuild the WSClient
+// on any down→up transition. If reachability stays broken for 15 min, we
+// exit(1) so PM2 restarts with a fresh environment.
+
+async function createAndStartWs(lark: any): Promise<void> {
+  if (!currentWsConfig || !currentEventDispatcher) {
+    throw new Error("[ws] config / dispatcher not initialized");
+  }
+  const fresh = new lark.WSClient({
+    appId: currentWsConfig.appId,
+    appSecret: currentWsConfig.appSecret,
+    autoReconnect: true,
+  });
+  await fresh.start({ eventDispatcher: currentEventDispatcher });
+  wsClientRef = fresh;
+}
+
+async function runNetworkSupervisor(lark: any): Promise<void> {
+  const PROBE_INTERVAL_MS = 30_000;
+  const DOWNTIME_THRESHOLD = 2; // 2 consecutive failures = truly down
+  const GIVE_UP_AFTER_MS = 15 * 60_000;
+
+  let consecutiveDown = 0;
+  let downSince = 0;
+
+  while (true) {
+    await new Promise((r) => setTimeout(r, PROBE_INTERVAL_MS));
+
+    const reachable = await probeFeishu();
+    if (reachable) {
+      if (consecutiveDown >= DOWNTIME_THRESHOLD) {
+        const downFor = Math.round((Date.now() - downSince) / 1000);
+        console.warn(
+          `[ws-supervisor] network recovered (was down ${downFor}s), rebuilding WS client`
+        );
+        try {
+          if (wsClientRef) {
+            try {
+              wsClientRef.close({ force: true });
+            } catch {}
+          }
+          await createAndStartWs(lark);
+          console.log("[ws-supervisor] WS client rebuilt");
+        } catch (err: any) {
+          console.error(
+            "[ws-supervisor] rebuild failed, will retry next cycle:",
+            err?.message || err
+          );
+          continue;
+        }
+      }
+      consecutiveDown = 0;
+      downSince = 0;
+    } else {
+      if (consecutiveDown === 0) downSince = Date.now();
+      consecutiveDown++;
+      const downMs = Date.now() - downSince;
+      if (downMs > GIVE_UP_AFTER_MS) {
+        console.error(
+          `[ws-supervisor] Feishu unreachable for ${Math.round(downMs / 60_000)}m — exit(1) for PM2 restart`
+        );
+        process.exit(1);
+      }
+    }
+  }
+}
+
+async function probeFeishu(): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5_000);
+  try {
+    const resp = await fetch("https://open.feishu.cn/", {
+      method: "HEAD",
+      signal: ctrl.signal,
+    });
+    return resp.status < 500;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── Reaction ────────────────────────────────────────

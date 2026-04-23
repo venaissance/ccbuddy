@@ -26,8 +26,16 @@ import {
   type EffortLevel,
   type SessionMeta,
 } from "./agent";
+import {
+  buildDailyCard,
+  getDemoCost,
+  getDemoReport,
+  isAgentRunning,
+  runDailyReportOnce,
+  todayStr,
+} from "./daily-report";
 import { getLarkClient, onCardAction } from "./feishu-ws";
-import { getHistoricalUsage, formatCostCNY } from "./usage";
+import { formatCostCNY, getHistoricalUsage } from "./usage";
 
 // ── Types ───────────────────────────────────────────
 
@@ -81,6 +89,7 @@ const commands: Record<string, CommandHandler> = {
   context: handleContext,
   status: handleStatus,
   help: handleHelp,
+  "daily-report": handleDailyReport,
 };
 
 // ── Public API ─────────────────────────────────────
@@ -244,32 +253,59 @@ function handleCost(ctx: CommandContext): CommandResult {
   const meta = getSessionMeta(ctx.sessionId);
   const history = getHistoricalUsage();
 
-  const lines: string[] = [];
-
-  // Current session
-  if (meta && meta.turnCount > 0) {
-    lines.push("**── 当前会话 ──**");
-    lines.push(`**模型**: ${meta.model} · ${meta.effort}`);
-    lines.push(`**对话轮数**: ${meta.turnCount}`);
-    lines.push(`**Tokens**: ${fmtTokens(meta.totalInputTokens)}↑ ${fmtTokens(meta.totalOutputTokens)}↓`);
-    lines.push(`**API 等价**: ${formatCostCNY(meta.totalCost)}（$${meta.totalCost.toFixed(4)}）`);
-    lines.push(`**会话时长**: ${formatUptime(Date.now() - meta.createdAt)}`);
-  }
-
-  // Historical total
-  if (history.totalTurns > 0) {
-    if (lines.length > 0) lines.push("");
-    lines.push("**── 历史总计 ──**");
-    lines.push(`**总轮数**: ${history.totalTurns}`);
-    lines.push(`**总 Tokens**: ${fmtTokens(history.totalInputTokens + history.totalOutputTokens)}（${fmtTokens(history.totalInputTokens)}↑ ${fmtTokens(history.totalOutputTokens)}↓）`);
-    lines.push(`**总 API 等价**: ${formatCostCNY(history.totalCostUsd)}（$${history.totalCostUsd.toFixed(2)}）`);
-  }
-
-  if (lines.length === 0) {
+  if ((!meta || meta.turnCount === 0) && history.totalTurns === 0) {
     return { header: "💰 用量", template: "grey", text: "尚无调用记录。" };
   }
 
-  return { header: "💰 用量统计", template: "blue", text: lines.join("\n") };
+  // Current session column
+  let currentCol = "**📋 当前会话**\n\n";
+  if (meta && meta.turnCount > 0) {
+    currentCol += `**模型**: ${meta.model} · ${meta.effort}\n`;
+    currentCol += `**轮数**: ${meta.turnCount}\n`;
+    currentCol += `**Tokens**: ${fmtTokens(meta.totalInputTokens)}↑ ${fmtTokens(meta.totalOutputTokens)}↓\n`;
+    currentCol += `**费用**: ${formatCostCNY(meta.totalCost)}（$${meta.totalCost.toFixed(4)}）\n`;
+    currentCol += `**时长**: ${formatUptime(Date.now() - meta.createdAt)}`;
+  } else {
+    currentCol += "无活跃会话";
+  }
+
+  // Historical column
+  let historyCol = "**📈 历史总计**\n\n";
+  if (history.totalTurns > 0) {
+    historyCol += `**总轮数**: ${history.totalTurns}\n`;
+    historyCol += `**总 Tokens**: ${fmtTokens(history.totalInputTokens + history.totalOutputTokens)}\n`;
+    historyCol += `（${fmtTokens(history.totalInputTokens)}↑ ${fmtTokens(history.totalOutputTokens)}↓）\n`;
+    historyCol += `**总费用**: ${formatCostCNY(history.totalCostUsd)}（$${history.totalCostUsd.toFixed(2)}）`;
+  } else {
+    historyCol += "暂无历史数据";
+  }
+
+  return {
+    header: "💰 用量统计",
+    template: "blue",
+    text: "",
+    elements: [
+      {
+        tag: "column_set",
+        flex_mode: "none",
+        background_style: "grey",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [{ tag: "markdown", content: currentCol }],
+          },
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [{ tag: "markdown", content: historyCol }],
+          },
+        ],
+      },
+    ],
+  };
 }
 
 async function handleCompact(ctx: CommandContext): Promise<CommandResult> {
@@ -301,9 +337,21 @@ async function handleCompact(ctx: CommandContext): Promise<CommandResult> {
         resolve({
           header: "📦 上下文已压缩",
           template: "green",
-          text: summary
-            ? `已压缩为摘要，下一条消息将基于此摘要开始新会话。\n\n---\n${summary}`
-            : "已压缩。下一条消息将开始新会话。",
+          text: "",
+          elements: summary
+            ? [
+                { tag: "markdown", content: "已压缩为摘要，下一条消息将基于此摘要开始新会话。" },
+                {
+                  tag: "collapsible_panel",
+                  expanded: false,
+                  header: {
+                    title: { tag: "lark_md", content: "📄 摘要（点击展开）" },
+                    background_color: "grey",
+                  },
+                  elements: [{ tag: "markdown", content: summary }],
+                },
+              ]
+            : [{ tag: "markdown", content: "已压缩。下一条消息将开始新会话。" }],
         });
       },
       onError: (err) => {
@@ -355,12 +403,34 @@ function handleContext(ctx: CommandContext): CommandResult {
   return {
     header: "📊 上下文使用",
     template: usagePct > 80 ? "red" : usagePct > 50 ? "orange" : "blue",
-    text:
-      `${bar} **${usagePct.toFixed(0)}%**\n\n` +
-      `**估算 tokens**: ~${formatNumber(estimatedTokens)} / ${formatNumber(contextLimit)}\n` +
-      `**对话轮数**: ${meta.turnCount}\n` +
-      `**Claude Session**: \`${claudeUuid.slice(0, 8)}...\`` +
-      hint,
+    text: "",
+    elements: [
+      {
+        tag: "markdown",
+        content:
+          `${bar} **${usagePct.toFixed(0)}%**\n\n` +
+          `**估算 tokens**: ~${formatNumber(estimatedTokens)} / ${formatNumber(contextLimit)}\n` +
+          `**对话轮数**: ${meta.turnCount}` +
+          hint,
+      },
+      {
+        tag: "collapsible_panel",
+        expanded: false,
+        header: {
+          title: { tag: "lark_md", content: "🔧 技术细节" },
+          background_color: "grey",
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content:
+              `**Claude Session**: \`${claudeUuid.slice(0, 8)}...\`\n` +
+              `**估算公式**: turnCount × 4,000 tokens/turn\n` +
+              `**上下文上限**: 200K tokens`,
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -369,23 +439,44 @@ function handleStatus(ctx: CommandContext): CommandResult {
   const claudeUuid = getClaudeSessionId(ctx.sessionId);
   const activeCount = getActiveCount();
 
-  const lines: string[] = [];
+  let leftCol = "**🔗 会话信息**\n\n";
+  leftCol += `**Session**: \`${ctx.sessionId.slice(0, 16)}...\`\n`;
+  leftCol += `**Claude**: ${claudeUuid ? `\`${claudeUuid.slice(0, 8)}...\`` : "无（新会话）"}\n`;
+  leftCol += `**运行中**: ${activeCount}`;
 
-  lines.push(`**会话 ID**: \`${ctx.sessionId.slice(0, 20)}...\``);
-  lines.push(`**Claude Session**: ${claudeUuid ? `\`${claudeUuid.slice(0, 8)}...\`` : "无（新会话）"}`);
-  lines.push(`**模型**: ${meta?.model || "opus"} · ${meta?.effort || "medium"}`);
-  lines.push(`**对话轮数**: ${meta?.turnCount || 0}`);
-  lines.push(`**累计费用**: $${(meta?.totalCost || 0).toFixed(4)}`);
-  lines.push(`**运行中任务**: ${activeCount}`);
-
+  let rightCol = "**⚙️ 配置 & 用量**\n\n";
+  rightCol += `**模型**: ${meta?.model || "opus"} · ${meta?.effort || "medium"}\n`;
+  rightCol += `**轮数**: ${meta?.turnCount || 0}\n`;
+  rightCol += `**费用**: $${(meta?.totalCost || 0).toFixed(4)}`;
   if (meta?.createdAt) {
-    lines.push(`**会话时长**: ${formatUptime(Date.now() - meta.createdAt)}`);
+    rightCol += `\n**时长**: ${formatUptime(Date.now() - meta.createdAt)}`;
   }
 
   return {
     header: "📋 会话状态",
     template: "blue",
-    text: lines.join("\n"),
+    text: "",
+    elements: [
+      {
+        tag: "column_set",
+        flex_mode: "none",
+        background_style: "grey",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [{ tag: "markdown", content: leftCol }],
+          },
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [{ tag: "markdown", content: rightCol }],
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -393,18 +484,95 @@ function handleHelp(): CommandResult {
   return {
     header: "📖 可用命令",
     template: "indigo",
-    text:
-      "| 命令 | 说明 |\n" +
-      "| --- | --- |\n" +
-      "| `/new` | 开始全新对话（清除上下文） |\n" +
-      "| `/stop` | 中断当前运行中的任务 |\n" +
-      "| `/model` | 切换模型和 effort 级别 |\n" +
-      "| `/cost` | 查看当前会话用量和费用 |\n" +
-      "| `/context` | 查看上下文使用情况 |\n" +
-      "| `/compact [重点]` | 压缩上下文（可指定保留重点） |\n" +
-      "| `/status` | 查看会话详细状态 |\n" +
-      "| `/auth` | 飞书数据授权 |\n" +
-      "| `/help` | 显示本帮助 |",
+    text: "",
+    elements: [
+      {
+        tag: "collapsible_panel",
+        expanded: true,
+        header: {
+          title: { tag: "lark_md", content: "🔄 会话管理" },
+          background_color: "grey",
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content:
+              "| 命令 | 说明 |\n| --- | --- |\n" +
+              "| `/new` | 开始全新对话（清除上下文） |\n" +
+              "| `/stop` | 中断当前运行中的任务 |\n" +
+              "| `/compact [重点]` | 压缩上下文（可指定保留重点） |",
+          },
+        ],
+      },
+      {
+        tag: "collapsible_panel",
+        expanded: false,
+        header: {
+          title: { tag: "lark_md", content: "🤖 模型设置" },
+          background_color: "grey",
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content: "| 命令 | 说明 |\n| --- | --- |\n| `/model` | 切换模型和 effort 级别 |",
+          },
+        ],
+      },
+      {
+        tag: "collapsible_panel",
+        expanded: false,
+        header: {
+          title: { tag: "lark_md", content: "📊 查询状态" },
+          background_color: "grey",
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content:
+              "| 命令 | 说明 |\n| --- | --- |\n" +
+              "| `/cost` | 查看当前会话用量和费用 |\n" +
+              "| `/context` | 查看上下文使用情况 |\n" +
+              "| `/status` | 查看会话详细状态 |",
+          },
+        ],
+      },
+      {
+        tag: "collapsible_panel",
+        expanded: false,
+        header: {
+          title: { tag: "lark_md", content: "🗞️ 日报" },
+          background_color: "grey",
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content:
+              "| 命令 | 说明 |\n| --- | --- |\n" +
+              "| `/daily-report` | 立即生成今日 AI 日报（Agent 采集，2-5 分钟，发到本聊天） |\n" +
+              "| `/daily-report demo` | 样式预览：秒级发送内置样本卡片（无需 Agent） |\n" +
+              "| `/daily-report render` | 从缓存 JSON 重新渲染今日卡片（秒级，用于调试样式） |\n" +
+              "| `/daily-report YYYY-MM-DD` | 重新渲染指定日期的历史日报 |",
+          },
+        ],
+      },
+      {
+        tag: "collapsible_panel",
+        expanded: false,
+        header: {
+          title: { tag: "lark_md", content: "🔐 系统" },
+          background_color: "grey",
+        },
+        elements: [
+          {
+            tag: "markdown",
+            content:
+              "| 命令 | 说明 |\n| --- | --- |\n" +
+              "| `/auth` | 飞书数据授权 |\n" +
+              "| `/help` | 显示本帮助 |",
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -431,10 +599,30 @@ function buildModelCardElements(meta: SessionMeta): any[] {
       content: `当前: **${MODEL_LABELS[meta.model] || meta.model}** · **${EFFORT_LABELS[meta.effort] || meta.effort}**`,
     },
     { tag: "hr" },
-    { tag: "markdown", content: "**模型**　选择 Claude 模型" },
-    ...modelButtons,
-    { tag: "markdown", content: "**Effort**　控制推理深度" },
-    ...effortButtons,
+    {
+      tag: "column_set",
+      flex_mode: "none",
+      columns: [
+        {
+          tag: "column",
+          width: "weighted",
+          weight: 1,
+          elements: [
+            { tag: "markdown", content: "**模型**　选择 Claude 模型" },
+            ...modelButtons,
+          ],
+        },
+        {
+          tag: "column",
+          width: "weighted",
+          weight: 1,
+          elements: [
+            { tag: "markdown", content: "**Effort**　控制推理深度" },
+            ...effortButtons,
+          ],
+        },
+      ],
+    },
     {
       tag: "markdown",
       content: "点击按钮即时切换，下一条消息生效。Opus 最强但最贵，Haiku 最快最便宜。",
@@ -527,4 +715,123 @@ function renderBar(pct: number): string {
   const filled = Math.round(pct / 5);
   const empty = 20 - filled;
   return "█".repeat(filled) + "░".repeat(empty);
+}
+
+// ── /daily-report ──────────────────────────────────
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Debug entry — runs the daily-report flow and sends the card to the chat
+ * where the command was invoked (NOT DAILY_REPORT_CHAT_ID).
+ *
+ * Modes:
+ *   /daily-report              — full flow: agent curates + writes JSON + sends card
+ *   /daily-report render       — skip agent, re-render today's cached JSON (fast style iteration)
+ *   /daily-report 2026-04-22   — re-render a specific date from cached JSON
+ */
+function handleDailyReport(ctx: CommandContext): CommandResult {
+  const arg = ctx.args.trim();
+  // Only the full real run (no args) targets DAILY_REPORT_CHAT_ID.
+  // demo / render / specific-date all stay in the invoking chat for debugging.
+  const configuredChatId = process.env.DAILY_REPORT_CHAT_ID?.trim();
+  const debugChatId = ctx.chatId;
+
+  if (!debugChatId) {
+    return {
+      header: "⚠️ 无法调试",
+      template: "red",
+      text: "/daily-report 仅在群聊 / 单聊中可用，需要能定位到 chat_id。",
+    };
+  }
+
+  // demo — instant style preview using built-in sample (no agent, no disk, no network).
+  // Sends the real daily card as a second message so what you see == what the group gets.
+  if (arg === "demo" || arg === "sample") {
+    const client = getLarkClient();
+    void (async () => {
+      if (!client) return;
+      try {
+        await client.im.v1.message.create({
+          params: { receive_id_type: "chat_id" },
+          data: {
+            receive_id: debugChatId,
+            msg_type: "interactive",
+            content: JSON.stringify(
+              buildDailyCard(getDemoReport(), getDemoCost()),
+            ),
+          },
+        });
+      } catch (err) {
+        console.error("[/daily-report demo] send failed:", err);
+      }
+    })();
+    return {
+      header: "🎨 样式预览",
+      template: "blue",
+      text: "下面在本聊天发一张样本卡片（秒级）。真跑 `/daily-report` 才会发到生产群。",
+    };
+  }
+
+  // render — specific date or today from cached JSON (debug, stays in this chat)
+  if (arg === "render" || arg === "preview" || DATE_RE.test(arg)) {
+    const date = DATE_RE.test(arg) ? arg : todayStr();
+    runDailyReportOnce({
+      targetChatId: debugChatId,
+      date,
+      skipAgent: true,
+    }).catch((err) => {
+      console.error("[/daily-report] Render failed:", err);
+    });
+    return {
+      header: "🔁 重新渲染中",
+      template: "blue",
+      text: `正在从缓存 JSON 渲染 **${date}** 的日报卡片到本聊天...`,
+    };
+  }
+
+  // Full flow — spawn agent, wait, send card
+  if (isAgentRunning()) {
+    return {
+      header: "⏳ 生成中",
+      template: "orange",
+      text: "另一份日报已在生成，请稍等（通常 2-5 分钟）。",
+    };
+  }
+
+  const date = todayStr();
+  // Full real run: target production group if configured, else fall back to the
+  // invoking chat (useful when env is not yet set).
+  const prodTargetChatId = configuredChatId || debugChatId;
+  const willSendToGroup =
+    Boolean(configuredChatId) && configuredChatId !== debugChatId;
+
+  void runDailyReportOnce({
+    targetChatId: prodTargetChatId,
+    date,
+    runAgent,
+  }).catch((err) => {
+    console.error("[/daily-report] Run failed:", err);
+  });
+
+  return {
+    header: "🚀 日报生成中",
+    template: "blue",
+    text: "",
+    elements: [
+      {
+        tag: "markdown",
+        content: `**${date}** AI Daily 正在生成...\n\n` +
+          "Agent 正在采集 80+ 数据源、筛选、压缩描述，预计 **2-5 分钟**。\n\n" +
+          (willSendToGroup
+            ? "完成后发到 **生产群**（`DAILY_REPORT_CHAT_ID`）。"
+            : "完成后发到本聊天（未配置 `DAILY_REPORT_CHAT_ID`）。"),
+      },
+      {
+        tag: "markdown",
+        text_size: "notation",
+        content: "💡 快速迭代样式：`/daily-report render`（跳过采集，复用今日 JSON）",
+      },
+    ],
+  };
 }
