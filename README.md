@@ -14,7 +14,7 @@ CCBuddy runs as a single Bun process that connects to Feishu via WebSocket, spaw
 
 - **Streaming replies** -- Token-level streaming via `--include-partial-messages`, smart FlushController (300ms + 30 char threshold), lazy card creation on first content, thinking state display
 - **Slash commands** -- `/model` (interactive card with model + effort picker), `/cost` (usage stats in ¥), `/new`, `/stop`, `/compact`, `/context`, `/status`, `/help`, `/daily-report` (on-demand AI briefing)
-- **Daily AI briefing** -- Cron at 07:00 wakes agent to produce a high-density Feishu card (≥9 AI news + 5 Product Hunt + 5 GitHub Trending), appends to a wiki doc, captures cost footer. 80+ curated sources, deterministic daemon-side distribution, 5-min agent watchdog.
+- **Daily AI briefing** -- Cron at 07:00 wakes agent to produce a high-density Feishu card (≥9 AI news + 5 Product Hunt + 5 GitHub Trending) and rebuilds the archive wiki newest-first. 80+ curated sources, deterministic daemon-side distribution, 5-min agent watchdog. Five-layer catchup defense (cron + startup + hourly poll + sleep/wake + missed-day notifier) survives App Nap throttling, PM2 restarts, OS sleep, and full-day laptop-off.
 - **Production-grade resilience** -- `ensureDataDirs()` prevents fresh-install ENOENT, global unhandled-error handlers keep the process alive through Feishu 5xx, a WS network supervisor rebuilds the WebSocket on connectivity changes and exits for PM2 restart after 15 min of unreachability.
 - **Usage tracking** -- Per-turn token counts, API-equivalent cost in CNY, persistent historical totals in SQLite, rate limit reset countdowns
 - **Feishu WebSocket** -- Persistent long connection, no webhook server needed, card action callbacks (`card.action.trigger`)
@@ -148,9 +148,23 @@ Every day at 07:00 (`DAILY_REPORT_CRON`, timezone `DAILY_REPORT_TZ`) the daemon 
 1. Loads the JSON and builds a dedicated Feishu card (blue header, metadata strip, flat news lists, collapsible sources panel, wiki button)
 2. Persists a `.cost.json` sidecar with tokens/cost/duration
 3. Sends the card to `DAILY_REPORT_CHAT_ID`
-4. Appends the markdown to the wiki at `DAILY_REPORT_WIKI_TOKEN` via `lark-cli`
+4. Rebuilds the wiki at `DAILY_REPORT_WIKI_TOKEN` newest-first via the Lark SDK (`docs_ai` overwrite). The wiki is a machine-maintained archive — manual edits will be lost by design
 
 A 5-minute watchdog kills runaway agents but still delivers whatever was written. Manual debug entry points: `/daily-report demo` (built-in sample), `/daily-report render` (reuse today's JSON), `/daily-report YYYY-MM-DD` (rerender historical).
+
+#### Reliability — five-layer defense against missed runs
+
+`node-cron` drops missed ticks under macOS App Nap throttling, so the in-process daemon adds four backups around the primary cron:
+
+| Layer | Trigger | Recovers from |
+|------|---------|---------------|
+| L1 cron | `0 7 * * *` with `recoverMissedExecutions: true` | App Nap throttling |
+| L2 startup catchup | 60s after daemon boot | PM2 restart spanning 7am |
+| L3 hourly poll | every 60min, time-based | L1 silent failure |
+| L4 wake catchup | clock-drift > 5min via `Date.now()` heartbeat | OS sleep/wake |
+| L5 missed-day notifier | 60s after boot, 7-day lookback | Laptop closed for entire day (alerts only, no backfill) |
+
+`CatchupGuard` ensures at most one run per calendar date per lifetime; `isAgentRunning()` prevents catchup from racing the primary cron. Tunable: `DAILY_REPORT_STARTUP_DELAY_MS`, `DAILY_REPORT_POLL_INTERVAL_MS`, `DAILY_REPORT_LOOKBACK_DAYS`. Effective SLA: report arrives within ~10 min of `max(7:00, daemon-online + 60s, laptop-wake + 60s)`.
 
 ### OAuth
 
@@ -178,7 +192,7 @@ src/
   db.ts             SQLite schema (Drizzle ORM), WAL mode
   api.ts            Hono REST routes: sessions, tasks, logs, memory
   cron.ts           Heartbeat scheduler with concurrency guard
-  daily-report.ts   07:00 AI briefing: agent runner + JSON contract + card builder + wiki append
+  daily-report.ts   07:00 AI briefing: agent runner + JSON contract + card builder + wiki sync (newest-first overwrite) + 5-layer catchup
 
 scripts/
   setup.sh          One-command install and PM2 setup

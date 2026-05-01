@@ -289,9 +289,7 @@ describe("daily-report — buildDailyCard", () => {
 		expect(md).toContain("### 📰 AI 重要新闻");
 		expect(md).toContain("### 🚀 Product Hunt Top");
 		expect(md).toContain("### 🔥 GitHub Trending Top");
-		expect(md).toContain(
-			"[xAI 与 Cursor 合作](https://x.ai/news/cursor)",
-		);
+		expect(md).toContain("[xAI 与 Cursor 合作](https://x.ai/news/cursor)");
 		expect(md).toContain("⭐+2548");
 		expect(md.trim().endsWith("---")).toBe(true);
 	});

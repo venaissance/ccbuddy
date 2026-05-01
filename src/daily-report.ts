@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import cron from "node-cron";
 import type { AgentOptions, AgentResult } from "./agent";
@@ -361,8 +361,134 @@ export function renderReportMarkdown(report: DailyReport): string {
 	return lines.join("\n");
 }
 
-/** Append markdown to a Feishu wiki document via lark-cli. */
-export async function appendToWiki(
+/** Permission-error fingerprint helper — used both inline and by the alert formatter. */
+export function isWikiPermissionError(err: unknown): boolean {
+	const msg = String((err as any)?.message ?? err ?? "");
+	return /permission denied|node permission|3380004|131006|forBidden|view or edit access/i.test(
+		msg,
+	);
+}
+
+/** List of YYYY-MM-DD dates that have a successful report JSON, newest first. */
+async function listArchivedDates(): Promise<string[]> {
+	try {
+		const files = await readdir(REPORT_DIR);
+		const dates = files
+			.filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+			.map((f) => f.replace(".json", ""));
+		dates.sort();
+		dates.reverse();
+		return dates;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Render the entire archive as a single markdown document, newest-first.
+ * Skips dates whose JSON fails to load — keeps wiki sync resilient against
+ * partial/broken files.
+ */
+async function renderArchiveMarkdown(
+	currentReport?: DailyReport,
+): Promise<string> {
+	const dates = await listArchivedDates();
+	const sections: string[] = [];
+	if (currentReport) {
+		// Use the in-memory current report (with wiki_url injected) instead of
+		// reloading from disk to avoid a race with the just-written file.
+		sections.push(renderReportMarkdown(currentReport));
+	}
+	for (const date of dates) {
+		if (currentReport && date === currentReport.date) continue;
+		try {
+			const r = await loadReport(date);
+			sections.push(renderReportMarkdown(r));
+		} catch (err) {
+			console.warn(`[daily-report] Skipping ${date} in archive sync:`, err);
+		}
+	}
+	return sections.join("\n\n");
+}
+
+/**
+ * Sync the wiki page from the archive: rebuild the entire document content
+ * with all reports newest-first via docs_ai overwrite. The wiki is a
+ * machine-maintained archive — manual edits will be lost, by design.
+ *
+ * Uses the daemon's Lark SDK (FEISHU_APP_ID) which holds the correct tenant
+ * permissions. Falls back to lark-cli for transient SDK errors only;
+ * permission errors fail fast (different tenant won't help).
+ */
+export async function syncWikiFromArchive(
+	wikiToken: string,
+	currentReport?: DailyReport,
+): Promise<void> {
+	const markdown = await renderArchiveMarkdown(currentReport);
+	if (!markdown.trim()) {
+		console.warn("[daily-report] Wiki sync skipped — empty archive");
+		return;
+	}
+
+	try {
+		await syncWikiViaSDK(wikiToken, markdown);
+		console.log(
+			`[daily-report] Wiki synced via SDK (${markdown.length} chars, newest-first)`,
+		);
+		return;
+	} catch (sdkErr: any) {
+		if (isWikiPermissionError(sdkErr)) {
+			throw sdkErr;
+		}
+		console.warn(
+			"[daily-report] SDK sync failed, falling back to lark-cli:",
+			sdkErr?.message || sdkErr,
+		);
+	}
+	await syncWikiViaCli(wikiToken, markdown);
+	console.log(
+		`[daily-report] Wiki synced via lark-cli fallback (${markdown.length} chars, newest-first)`,
+	);
+}
+
+/** Resolve wiki node → docx token, then docs_ai overwrite with markdown. */
+async function syncWikiViaSDK(
+	wikiToken: string,
+	markdown: string,
+): Promise<void> {
+	const client = getLarkClient();
+	if (!client) throw new Error("lark client not initialized");
+
+	const nodeResp: any = await (client as any).wiki.v2.space.getNode({
+		params: { token: wikiToken, obj_type: "wiki" },
+	});
+	const docToken = nodeResp?.data?.node?.obj_token;
+	if (!docToken) {
+		throw new Error(
+			`wiki node lookup returned no obj_token (resp=${JSON.stringify(nodeResp)?.slice(0, 200)})`,
+		);
+	}
+
+	const updateResp: any = await (client as any).request({
+		method: "PUT",
+		url: `/open-apis/docs_ai/v1/documents/${docToken}`,
+		data: {
+			block_id: "-1",
+			command: "overwrite",
+			content: markdown,
+			format: "markdown",
+			revision_id: -1,
+		},
+	});
+	if (updateResp?.code && updateResp.code !== 0) {
+		throw new Error(
+			`docs_ai overwrite returned code=${updateResp.code} msg=${updateResp.msg}`,
+		);
+	}
+}
+
+/** Fallback path — lark-cli with the same overwrite semantics (different tenant identity). */
+async function syncWikiViaCli(
 	wikiToken: string,
 	markdown: string,
 ): Promise<void> {
@@ -373,14 +499,21 @@ export async function appendToWiki(
 			[
 				"docs",
 				"+update",
+				"--api-version",
+				"v2",
 				"--doc",
 				docUrl,
-				"--mode",
-				"append",
-				"--markdown",
+				"--command",
+				"overwrite",
+				"--doc-format",
+				"markdown",
+				"--content",
 				markdown,
 			],
-			{ stdio: ["ignore", "pipe", "pipe"] },
+			{
+				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, LARK_CLI_NO_PROXY: "1" },
+			},
 		);
 		let stdout = "";
 		let stderr = "";
@@ -392,9 +525,6 @@ export async function appendToWiki(
 		});
 		proc.on("close", (code) => {
 			if (code === 0) {
-				console.log(
-					`[daily-report] Wiki append ok (${markdown.length} chars)`,
-				);
 				resolvePromise();
 			} else {
 				reject(
@@ -562,10 +692,10 @@ export async function runDailyReportOnce(opts: RunOptions): Promise<void> {
 				try {
 					// Kill the agent claude subprocess by session id. Best-effort:
 					// find and SIGTERM any `claude ... daily-report-${date}` pid.
-					spawn("pkill", [
-						"-f",
-						`claude.*daily-report-${date}`,
-					]).on("close", () => settle());
+					spawn("pkill", ["-f", `claude.*daily-report-${date}`]).on(
+						"close",
+						() => settle(),
+					);
 				} catch {
 					settle();
 				}
@@ -667,17 +797,22 @@ export async function runDailyReportOnce(opts: RunOptions): Promise<void> {
 		);
 	}
 
-	// Wiki append (independent step; failure should not block card delivery)
+	// Wiki sync — overwrite the entire wiki page with newest-first archive view.
+	// Independent of card delivery; failure surfaces as actionable Feishu alert.
 	if (wikiToken) {
 		try {
-			const md = renderReportMarkdown(report);
-			await appendToWiki(wikiToken, md);
-			console.log(`[daily-report] Wiki appended for ${date}`);
+			await syncWikiFromArchive(wikiToken, report);
+			console.log(`[daily-report] Wiki synced (newest-first) for ${date}`);
 		} catch (err: any) {
-			console.error("[daily-report] Wiki append failed:", err);
+			console.error("[daily-report] Wiki sync failed:", err);
+			const isPermissionErr = isWikiPermissionError(err);
+			const appId = process.env.FEISHU_APP_ID || "(unset)";
+			const hint = isPermissionErr
+				? `\n\n💡 修复：打开 wiki 页面 → 右上角『···』→『协作』→ 添加 CCBuddy bot（app_id: ${appId}）→ 设为『可编辑』。\n   下次 7am cron 自动恢复。`
+				: "";
 			await sendTextAlert(
 				targetChatId,
-				`⚠️ Wiki 追加失败（${date}），卡片已发送但 wiki 文档未更新\n\n${err?.message || err}`,
+				`⚠️ Wiki 同步失败（${date}），卡片已发送但 wiki 文档未更新${hint}\n\n${err?.message || err}`,
 			);
 		}
 	}
@@ -756,29 +891,99 @@ export function getDemoReport(): DailyReport {
 			},
 		],
 		product_hunt: [
-			{ rank: 1, title: "Magic Layers by Canva", url: "https://www.producthunt.com/posts/magic-layers", desc: "图片转可编辑设计" },
-			{ rank: 2, title: "Chat Skills for AI Agents", url: "https://www.producthunt.com/posts/chat-skills", desc: "给 Agent 加聊天能力" },
-			{ rank: 3, title: "Cosmic Agent Marketplace", url: "https://www.producthunt.com/posts/cosmic", desc: "CMS 里的 AI 代理" },
-			{ rank: 4, title: "delegare", url: "https://www.producthunt.com/posts/delegare", desc: "受控 Agent 支付" },
-			{ rank: 5, title: "Harker 2.0", url: "https://www.producthunt.com/posts/harker", desc: "本地语音转写" },
+			{
+				rank: 1,
+				title: "Magic Layers by Canva",
+				url: "https://www.producthunt.com/posts/magic-layers",
+				desc: "图片转可编辑设计",
+			},
+			{
+				rank: 2,
+				title: "Chat Skills for AI Agents",
+				url: "https://www.producthunt.com/posts/chat-skills",
+				desc: "给 Agent 加聊天能力",
+			},
+			{
+				rank: 3,
+				title: "Cosmic Agent Marketplace",
+				url: "https://www.producthunt.com/posts/cosmic",
+				desc: "CMS 里的 AI 代理",
+			},
+			{
+				rank: 4,
+				title: "delegare",
+				url: "https://www.producthunt.com/posts/delegare",
+				desc: "受控 Agent 支付",
+			},
+			{
+				rank: 5,
+				title: "Harker 2.0",
+				url: "https://www.producthunt.com/posts/harker",
+				desc: "本地语音转写",
+			},
 		],
 		github_trending: [
-			{ rank: 1, repo: "Fincept-Corporation/FinceptTerminal", url: "https://github.com/Fincept-Corporation/FinceptTerminal", desc: "金融终端与市场分析", stars_added: 2548 },
-			{ rank: 2, repo: "thunderbird/thunderbolt", url: "https://github.com/thunderbird/thunderbolt", desc: "自控模型的 AI 客户端", stars_added: 596 },
-			{ rank: 3, repo: "zilliztech/claude-context", url: "https://github.com/zilliztech/claude-context", desc: "Claude Code 代码搜索 MCP", stars_added: 169 },
-			{ rank: 4, repo: "ruvnet/RuView", url: "https://github.com/ruvnet/RuView", desc: "WiFi 人体姿态识别", stars_added: 824 },
-			{ rank: 5, repo: "microsoft/ai-agents-for-beginners", url: "https://github.com/microsoft/ai-agents-for-beginners", desc: "AI Agent 入门课程", stars_added: 200 },
+			{
+				rank: 1,
+				repo: "Fincept-Corporation/FinceptTerminal",
+				url: "https://github.com/Fincept-Corporation/FinceptTerminal",
+				desc: "金融终端与市场分析",
+				stars_added: 2548,
+			},
+			{
+				rank: 2,
+				repo: "thunderbird/thunderbolt",
+				url: "https://github.com/thunderbird/thunderbolt",
+				desc: "自控模型的 AI 客户端",
+				stars_added: 596,
+			},
+			{
+				rank: 3,
+				repo: "zilliztech/claude-context",
+				url: "https://github.com/zilliztech/claude-context",
+				desc: "Claude Code 代码搜索 MCP",
+				stars_added: 169,
+			},
+			{
+				rank: 4,
+				repo: "ruvnet/RuView",
+				url: "https://github.com/ruvnet/RuView",
+				desc: "WiFi 人体姿态识别",
+				stars_added: 824,
+			},
+			{
+				rank: 5,
+				repo: "microsoft/ai-agents-for-beginners",
+				url: "https://github.com/microsoft/ai-agents-for-beginners",
+				desc: "AI Agent 入门课程",
+				stars_added: 200,
+			},
 		],
 		sources_meta: {
 			breakdown: [
-				"Anthropic Blog", "OpenAI Blog", "Google DeepMind", "xAI News",
-				"Meta AI", "DeepSeek", "Qwen Blog", "ByteDance Seed",
-				"arXiv cs.AI", "HuggingFace Daily Papers", "Hacker News",
-				"TechCrunch AI", "The Information", "Product Hunt",
-				"GitHub Trending", "HuggingFace Trending", "量子位",
-				"机器之心", "新智元", "36kr AI",
+				"Anthropic Blog",
+				"OpenAI Blog",
+				"Google DeepMind",
+				"xAI News",
+				"Meta AI",
+				"DeepSeek",
+				"Qwen Blog",
+				"ByteDance Seed",
+				"arXiv cs.AI",
+				"HuggingFace Daily Papers",
+				"Hacker News",
+				"TechCrunch AI",
+				"The Information",
+				"Product Hunt",
+				"GitHub Trending",
+				"HuggingFace Trending",
+				"量子位",
+				"机器之心",
+				"新智元",
+				"36kr AI",
 			],
-			method: "24h 窗口 · 80 源并检 · 全通过筛选（时效/实质/显著/一手/去重）· Tier 1-3 一手优先",
+			method:
+				"24h 窗口 · 80 源并检 · 全通过筛选（时效/实质/显著/一手/去重）· Tier 1-3 一手优先",
 		},
 	};
 }
@@ -847,7 +1052,11 @@ export function isCatchupNeeded(
 	const date = todayStr(now);
 	const parsed = parseSimpleCron(schedule);
 	if (!parsed) {
-		return { needed: false, reason: "non-standard cron, catchup disabled", date };
+		return {
+			needed: false,
+			reason: "non-standard cron, catchup disabled",
+			date,
+		};
 	}
 	const scheduledAt = todaysScheduledTime(parsed.hour, parsed.minute, now);
 	if (now.getTime() < scheduledAt.getTime()) {
@@ -1016,7 +1225,9 @@ export function initDailyReport(
 			}
 			return;
 		}
-		console.log(`[daily-report] Catchup (${trigger}): ${decision.reason} — running now`);
+		console.log(
+			`[daily-report] Catchup (${trigger}): ${decision.reason} — running now`,
+		);
 		runDailyReportOnce({ targetChatId: chatId, runAgent }).catch((err) => {
 			console.error("[daily-report] Catchup run failed:", err);
 		});
@@ -1029,9 +1240,7 @@ export function initDailyReport(
 	const startupDelayMs = Number(
 		process.env.DAILY_REPORT_STARTUP_DELAY_MS || 60_000,
 	);
-	const lookbackDays = Number(
-		process.env.DAILY_REPORT_LOOKBACK_DAYS || 7,
-	);
+	const lookbackDays = Number(process.env.DAILY_REPORT_LOOKBACK_DAYS || 7);
 	setTimeout(() => {
 		tryCatchup("startup");
 		notifyMissedReports(chatId, lookbackDays).catch((err) => {
