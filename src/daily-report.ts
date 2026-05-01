@@ -805,6 +805,162 @@ EXIT CONDITIONS (very important — follow exactly):
 Do NOT send any Feishu message yourself. Do NOT call lark-cli or lark-doc — the daemon owns wiki distribution after you exit.`;
 }
 
+// ── Catchup ─────────────────────────────────────────
+//
+// node-cron is in-memory and "fire-and-forget": if the laptop is suspended at
+// the scheduled tick or the daemon is restarting (PM2 + ws-supervisor exit(1)),
+// the day's report is permanently lost. The pieces below detect that situation
+// on startup and after sleep/wake transitions, and re-trigger the run.
+
+/** Parse the simple "M H * * *" cron form daily-report uses. Returns null for anything else. */
+export function parseSimpleCron(
+	expr: string,
+): { hour: number; minute: number } | null {
+	const parts = expr.trim().split(/\s+/);
+	if (parts.length !== 5) return null;
+	if (parts[2] !== "*" || parts[3] !== "*" || parts[4] !== "*") return null;
+	const minute = Number(parts[0]);
+	const hour = Number(parts[1]);
+	if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+	if (!Number.isInteger(hour) || hour < 0 || hour > 23) return null;
+	return { hour, minute };
+}
+
+function todaysScheduledTime(hour: number, minute: number, now: Date): Date {
+	const t = new Date(now);
+	t.setHours(hour, minute, 0, 0);
+	return t;
+}
+
+export interface CatchupDecision {
+	needed: boolean;
+	reason: string;
+	date: string;
+}
+
+/** Is today's run overdue and the JSON missing? Pure aside from the injected `exists` probe. */
+export function isCatchupNeeded(
+	schedule: string,
+	now: Date = new Date(),
+	exists: (p: string) => boolean = existsSync,
+): CatchupDecision {
+	const date = todayStr(now);
+	const parsed = parseSimpleCron(schedule);
+	if (!parsed) {
+		return { needed: false, reason: "non-standard cron, catchup disabled", date };
+	}
+	const scheduledAt = todaysScheduledTime(parsed.hour, parsed.minute, now);
+	if (now.getTime() < scheduledAt.getTime()) {
+		return { needed: false, reason: "before today's scheduled time", date };
+	}
+	if (exists(reportPath(date))) {
+		return { needed: false, reason: `${date}.json already present`, date };
+	}
+	const hh = String(parsed.hour).padStart(2, "0");
+	const mm = String(parsed.minute).padStart(2, "0");
+	return {
+		needed: true,
+		reason: `${date}.json missing past scheduled ${hh}:${mm}`,
+		date,
+	};
+}
+
+/** Per-daemon-lifetime catchup gate: at most one catchup run per calendar date. */
+class CatchupGuard {
+	private lastRunDate: string | null = null;
+	tryClaim(date: string): boolean {
+		if (this.lastRunDate === date) return false;
+		this.lastRunDate = date;
+		return true;
+	}
+}
+
+// ── Missed-day notifier ─────────────────────────────
+//
+// Pure in-process defenses can't recover days the laptop was fully off. When
+// the daemon comes back online, surface those gaps as a single Feishu alert
+// so the user knows *why* a day is missing — without trying to backfill
+// stale news. Persisted dedupe via notified.json prevents repeat alerts.
+
+const NOTIFIED_FILE = join(REPORT_DIR, "notified.json");
+
+async function loadNotified(): Promise<Set<string>> {
+	try {
+		if (!existsSync(NOTIFIED_FILE)) return new Set();
+		const raw = JSON.parse(await readFile(NOTIFIED_FILE, "utf-8")) as {
+			dates?: string[];
+		};
+		return new Set(raw.dates || []);
+	} catch {
+		return new Set();
+	}
+}
+
+async function saveNotified(dates: Set<string>): Promise<void> {
+	await writeFile(
+		NOTIFIED_FILE,
+		JSON.stringify({ dates: Array.from(dates).sort() }, null, 2),
+		"utf-8",
+	);
+}
+
+/** Past `days` calendar dates (excluding today), most recent first. */
+export function pastDateRange(end: Date, days: number): string[] {
+	const result: string[] = [];
+	for (let i = 1; i <= days; i++) {
+		const d = new Date(end);
+		d.setDate(d.getDate() - i);
+		result.push(todayStr(d));
+	}
+	return result;
+}
+
+/**
+ * Detect past days whose report JSON is missing and haven't been alerted yet.
+ * Returns the newly-missed dates (caller decides whether to send the alert).
+ * Pure aside from the injected `exists` probe.
+ */
+export function findUnnotifiedMissed(
+	candidates: string[],
+	notified: Set<string>,
+	exists: (p: string) => boolean = existsSync,
+): string[] {
+	return candidates.filter(
+		(date) => !exists(reportPath(date)) && !notified.has(date),
+	);
+}
+
+export async function notifyMissedReports(
+	targetChatId: string,
+	lookbackDays = 7,
+	now: Date = new Date(),
+): Promise<string[]> {
+	const notified = await loadNotified();
+	const candidates = pastDateRange(now, lookbackDays);
+	const newlyMissed = findUnnotifiedMissed(candidates, notified);
+	if (newlyMissed.length === 0) return [];
+
+	const lines = [
+		`⚠️ 发现 ${newlyMissed.length} 天 AI 日报未生成（电脑休眠/离线导致）：`,
+		"",
+		...newlyMissed.map((d) => `  • ${d}`),
+		"",
+		"这些天的内容已过期，不会自动补发。如需手动重生成，回 `/daily-report YYYY-MM-DD` 重渲染（需有缓存 JSON）。",
+	];
+	await sendTextAlert(targetChatId, lines.join("\n"));
+
+	for (const d of newlyMissed) notified.add(d);
+	try {
+		await saveNotified(notified);
+	} catch (err) {
+		console.error("[daily-report] Failed to persist notified.json:", err);
+	}
+	console.log(
+		`[daily-report] Notified missed dates: ${newlyMissed.join(", ")}`,
+	);
+	return newlyMissed;
+}
+
 // ── Init ────────────────────────────────────────────
 
 export function initDailyReport(
@@ -824,6 +980,9 @@ export function initDailyReport(
 		return;
 	}
 
+	// node-cron 3.0.3 default autorecover=false drops missed ticks. macOS App Nap
+	// throttling can delay the 1s polling enough to skip the 7:00:00 boundary.
+	// recoverMissedExecutions: true makes the next tick replay any missed seconds.
 	cron.schedule(
 		schedule,
 		() => {
@@ -831,7 +990,78 @@ export function initDailyReport(
 				console.error("[daily-report] Cron run failed:", err);
 			});
 		},
-		{ timezone },
+		{ timezone, recoverMissedExecutions: true } as any,
 	);
 	console.log(`[daily-report] Scheduler active: "${schedule}" (${timezone})`);
+
+	const catchupGuard = new CatchupGuard();
+	const tryCatchup = (trigger: string) => {
+		// Don't race the primary cron path — if an agent run is in flight, leave it alone.
+		if (isAgentRunning()) return;
+		const decision = isCatchupNeeded(schedule);
+		if (!decision.needed) {
+			// Polling fires every few minutes; only log skips for non-poll triggers.
+			if (trigger !== "poll") {
+				console.log(
+					`[daily-report] Catchup (${trigger}): skip — ${decision.reason}`,
+				);
+			}
+			return;
+		}
+		if (!catchupGuard.tryClaim(decision.date)) {
+			if (trigger !== "poll") {
+				console.log(
+					`[daily-report] Catchup (${trigger}): ${decision.date} already attempted this lifetime`,
+				);
+			}
+			return;
+		}
+		console.log(`[daily-report] Catchup (${trigger}): ${decision.reason} — running now`);
+		runDailyReportOnce({ targetChatId: chatId, runAgent }).catch((err) => {
+			console.error("[daily-report] Catchup run failed:", err);
+		});
+	};
+
+	// Layer 2 — Startup catchup: wait for Feishu WS / proxy to settle before firing.
+	// Same delay also runs the missed-day notifier (path 3 — surface days where
+	// laptop was off all day so the user knows why a day is missing, without
+	// trying to backfill stale news).
+	const startupDelayMs = Number(
+		process.env.DAILY_REPORT_STARTUP_DELAY_MS || 60_000,
+	);
+	const lookbackDays = Number(
+		process.env.DAILY_REPORT_LOOKBACK_DAYS || 7,
+	);
+	setTimeout(() => {
+		tryCatchup("startup");
+		notifyMissedReports(chatId, lookbackDays).catch((err) => {
+			console.error("[daily-report] Missed-day notifier failed:", err);
+		});
+	}, startupDelayMs);
+
+	// Layer 3 — Periodic polling catchup: time-based, defense against cron miss
+	// (node-cron + App Nap) and any silent failure of the primary cron path.
+	// CatchupGuard + isAgentRunning() ensure at most one run per calendar date.
+	// Hourly is sub-cron-cost; tighten via env if you want faster post-7am recovery.
+	const pollIntervalMs = Number(
+		process.env.DAILY_REPORT_POLL_INTERVAL_MS || 60 * 60_000,
+	);
+	setInterval(() => tryCatchup("poll"), pollIntervalMs);
+
+	// Layer 4 — Sleep/wake fast-path: drift-based heartbeat. Fires within ~1
+	// minute of wake (vs up to 5 min for the polling layer).
+	const heartbeatMs = 60_000;
+	const driftThresholdMs = 5 * 60_000;
+	let lastTickAt = Date.now();
+	setInterval(() => {
+		const now = Date.now();
+		const drift = now - lastTickAt;
+		lastTickAt = now;
+		if (drift > driftThresholdMs) {
+			console.log(
+				`[daily-report] Clock drift ${Math.round(drift / 1000)}s detected — likely wake from sleep`,
+			);
+			tryCatchup("wake");
+		}
+	}, heartbeatMs);
 }

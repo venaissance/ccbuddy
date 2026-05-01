@@ -18,8 +18,12 @@ import {
 	type DailyReport,
 	type RunCostInfo,
 	buildDailyCard,
+	findUnnotifiedMissed,
 	getDemoCost,
 	getDemoReport,
+	isCatchupNeeded,
+	parseSimpleCron,
+	pastDateRange,
 	renderReportMarkdown,
 	reportPath,
 	todayStr,
@@ -317,5 +321,120 @@ describe("daily-report — buildDailyCard", () => {
 				typeof e?.content === "string" && e.content.includes("AI 重要新闻"),
 		);
 		expect(newsBlock.content).toContain("（9 条）");
+	});
+});
+
+describe("daily-report — parseSimpleCron", () => {
+	test("parses standard '0 7 * * *'", () => {
+		expect(parseSimpleCron("0 7 * * *")).toEqual({ hour: 7, minute: 0 });
+	});
+
+	test("parses with extra whitespace", () => {
+		expect(parseSimpleCron("  30   8   *  *  *  ")).toEqual({
+			hour: 8,
+			minute: 30,
+		});
+	});
+
+	test("rejects ranges and lists", () => {
+		expect(parseSimpleCron("0 7 * * 1-5")).toBeNull();
+		expect(parseSimpleCron("0 7,19 * * *")).toBeNull();
+		expect(parseSimpleCron("*/15 * * * *")).toBeNull();
+	});
+
+	test("rejects out-of-range values", () => {
+		expect(parseSimpleCron("60 7 * * *")).toBeNull();
+		expect(parseSimpleCron("0 24 * * *")).toBeNull();
+		expect(parseSimpleCron("-1 7 * * *")).toBeNull();
+	});
+
+	test("rejects wrong field count", () => {
+		expect(parseSimpleCron("0 7 *")).toBeNull();
+		expect(parseSimpleCron("")).toBeNull();
+	});
+});
+
+describe("daily-report — isCatchupNeeded", () => {
+	const schedule = "0 7 * * *";
+
+	test("before scheduled time → no catchup", () => {
+		const now = new Date(2026, 4, 1, 6, 30, 0);
+		const decision = isCatchupNeeded(schedule, now, () => false);
+		expect(decision.needed).toBe(false);
+		expect(decision.reason).toContain("before");
+	});
+
+	test("after scheduled time and file exists → no catchup", () => {
+		const now = new Date(2026, 4, 1, 11, 0, 0);
+		const decision = isCatchupNeeded(schedule, now, () => true);
+		expect(decision.needed).toBe(false);
+		expect(decision.reason).toContain("already present");
+	});
+
+	test("after scheduled time and file missing → catchup", () => {
+		const now = new Date(2026, 4, 1, 11, 0, 0);
+		const decision = isCatchupNeeded(schedule, now, () => false);
+		expect(decision.needed).toBe(true);
+		expect(decision.date).toBe("2026-05-01");
+		expect(decision.reason).toContain("07:00");
+	});
+
+	test("non-standard cron → catchup disabled", () => {
+		const now = new Date(2026, 4, 1, 11, 0, 0);
+		const decision = isCatchupNeeded("*/15 * * * *", now, () => false);
+		expect(decision.needed).toBe(false);
+		expect(decision.reason).toContain("non-standard");
+	});
+
+	test("uses today's date based on local clock", () => {
+		const now = new Date(2026, 3, 30, 23, 30, 0);
+		const decision = isCatchupNeeded(schedule, now, () => false);
+		expect(decision.date).toBe("2026-04-30");
+	});
+});
+
+describe("daily-report — pastDateRange", () => {
+	test("returns N most-recent past dates excluding today", () => {
+		const end = new Date(2026, 4, 1); // 2026-05-01
+		const result = pastDateRange(end, 3);
+		expect(result).toEqual(["2026-04-30", "2026-04-29", "2026-04-28"]);
+	});
+
+	test("handles month boundary", () => {
+		const end = new Date(2026, 4, 2);
+		const result = pastDateRange(end, 4);
+		expect(result).toEqual([
+			"2026-05-01",
+			"2026-04-30",
+			"2026-04-29",
+			"2026-04-28",
+		]);
+	});
+
+	test("returns empty for 0 days", () => {
+		expect(pastDateRange(new Date(2026, 4, 1), 0)).toEqual([]);
+	});
+});
+
+describe("daily-report — findUnnotifiedMissed", () => {
+	test("returns dates that are both missing and not yet notified", () => {
+		const candidates = ["2026-04-30", "2026-04-29", "2026-04-28"];
+		const notified = new Set(["2026-04-28"]);
+		const exists = (p: string) => p.includes("2026-04-29"); // 4-29 generated
+		const result = findUnnotifiedMissed(candidates, notified, exists);
+		expect(result).toEqual(["2026-04-30"]);
+	});
+
+	test("returns empty when all are either generated or already notified", () => {
+		const candidates = ["2026-04-30", "2026-04-29"];
+		const notified = new Set(["2026-04-30"]);
+		const exists = (p: string) => p.includes("2026-04-29");
+		expect(findUnnotifiedMissed(candidates, notified, exists)).toEqual([]);
+	});
+
+	test("returns all candidates when none generated and none notified", () => {
+		const candidates = ["2026-04-30", "2026-04-29"];
+		const result = findUnnotifiedMissed(candidates, new Set(), () => false);
+		expect(result).toEqual(["2026-04-30", "2026-04-29"]);
 	});
 });
