@@ -5,6 +5,7 @@ import { serveStatic } from "hono/bun";
 import { serve } from "bun";
 import { createDB, initDB } from "./db";
 import { registerRoutes } from "./api";
+import { registerCCProgressRoutes } from "./cc-progress";
 import { initMemory } from "./memory";
 import { initCron } from "./cron";
 import { initDailyReport } from "./daily-report";
@@ -74,6 +75,7 @@ async function main() {
   // 4. Setup HTTP server
   const app = new Hono();
   registerRoutes(app, sqlite, SESSIONS_DIR, MEMORY_DIR);
+  registerCCProgressRoutes(app);
   app.use("/*", serveStatic({ root: "./web/dist" }));
   serve({ port: PORT, fetch: app.fetch });
   console.log(`[init] HTTP server on :${PORT}`);
