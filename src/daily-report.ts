@@ -669,7 +669,7 @@ export async function runDailyReportOnce(opts: RunOptions): Promise<void> {
 
 	const prompt = buildAgentPrompt(date, absOutPath);
 	const runStartedAt = Date.now();
-	const WATCHDOG_MS = Number(process.env.DAILY_REPORT_TIMEOUT_MS || 5 * 60_000);
+	const WATCHDOG_MS = Number(process.env.DAILY_REPORT_TIMEOUT_MS || 15 * 60_000);
 	let capturedResult: AgentResult | null = null;
 	let toolCalls = 0;
 	let timedOut = false;
@@ -1082,6 +1082,9 @@ class CatchupGuard {
 		this.lastRunDate = date;
 		return true;
 	}
+	release(date: string): void {
+		if (this.lastRunDate === date) this.lastRunDate = null;
+	}
 }
 
 // ── Missed-day notifier ─────────────────────────────
@@ -1230,6 +1233,7 @@ export function initDailyReport(
 		);
 		runDailyReportOnce({ targetChatId: chatId, runAgent }).catch((err) => {
 			console.error("[daily-report] Catchup run failed:", err);
+			catchupGuard.release(decision.date);
 		});
 	};
 
