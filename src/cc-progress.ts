@@ -7,6 +7,7 @@
  * accepted but only update in-memory state, no card update yet.
  */
 
+import { open, stat } from "node:fs/promises";
 import type { Hono } from "hono";
 import { getLarkClient } from "./feishu-ws";
 
@@ -43,7 +44,15 @@ export interface SessionState {
 	lastUserPrompt?: string;
 	toolCount: number;
 	status: SessionStatus;
+	/** Legacy: id of the per-session card. Now reused as `threadRootMessageId`. */
 	feishuMessageId?: string;
+
+	// Thread mode (Q1=session-thread, Q2=per-turn aggregate, Q3=tool-fold)
+	transcriptPath?: string;
+	threadRootMessageId?: string;
+	lastTranscriptOffset: number;
+	turnNumber: number;
+	currentTurnStartedAt: number;
 }
 
 // ── State ───────────────────────────────────────────
@@ -79,19 +88,100 @@ function targetChatId(): string | undefined {
 function getOrCreate(sessionId: string, cwd: string): SessionState {
 	let s = sessions.get(sessionId);
 	if (!s) {
+		const now = Date.now();
 		s = {
 			sessionId,
 			shortId: shortId(sessionId),
 			cwd,
 			projectName: projectName(cwd),
-			startedAt: Date.now(),
-			lastEventAt: Date.now(),
+			startedAt: now,
+			lastEventAt: now,
 			toolCount: 0,
 			status: "running",
+			lastTranscriptOffset: 0,
+			turnNumber: 0,
+			currentTurnStartedAt: now,
 		};
 		sessions.set(sessionId, s);
 	}
 	return s;
+}
+
+// ── Transcript parser ───────────────────────────────
+
+export interface TranscriptDelta {
+	assistantText: string;
+	toolCounts: Record<string, number>;
+	newOffset: number;
+}
+
+/**
+ * Read a CC transcript JSONL from `fromOffset` to EOF and extract:
+ *   - concatenated assistant text (skipping `thinking` and tool_result blocks)
+ *   - tool_use counts per tool name
+ *   - the new byte offset to use for the next incremental read
+ *
+ * Pure aside from filesystem reads. Designed so a Stop hook can call it
+ * after each turn and feed the result straight into a thread reply.
+ */
+export async function parseTranscriptDelta(
+	path: string,
+	fromOffset: number,
+): Promise<TranscriptDelta> {
+	let fileSize: number;
+	try {
+		const st = await stat(path);
+		fileSize = st.size;
+	} catch {
+		return { assistantText: "", toolCounts: {}, newOffset: 0 };
+	}
+	if (fromOffset >= fileSize) {
+		return { assistantText: "", toolCounts: {}, newOffset: fileSize };
+	}
+
+	let buf = "";
+	try {
+		const fh = await open(path, "r");
+		try {
+			const len = fileSize - fromOffset;
+			const data = Buffer.alloc(len);
+			await fh.read(data, 0, len, fromOffset);
+			buf = data.toString("utf8");
+		} finally {
+			await fh.close();
+		}
+	} catch {
+		return { assistantText: "", toolCounts: {}, newOffset: fromOffset };
+	}
+
+	const texts: string[] = [];
+	const toolCounts: Record<string, number> = {};
+	const lines = buf.split("\n");
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry?.type !== "assistant") continue;
+		const content = entry?.message?.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (block?.type === "text" && typeof block.text === "string") {
+				if (block.text.trim()) texts.push(block.text.trim());
+			} else if (block?.type === "tool_use" && typeof block.name === "string") {
+				toolCounts[block.name] = (toolCounts[block.name] || 0) + 1;
+			}
+		}
+	}
+
+	return {
+		assistantText: texts.join("\n\n"),
+		toolCounts,
+		newOffset: fileSize,
+	};
 }
 
 // ── Card builder ────────────────────────────────────
@@ -149,58 +239,175 @@ function truncate(s: string, max: number): string {
 	return s.length <= max ? s : `${s.slice(0, max)}…`;
 }
 
+// ── Turn-reply card ─────────────────────────────────
+//
+// Posted to the session's thread once per agent turn. Carries the actual
+// claude code output (assistant text) so the user can read what the agent
+// produced — not just metadata. Tool calls are folded into a one-line summary.
+
+export interface TurnSummary {
+	turnNumber: number;
+	elapsedSec: number;
+	assistantText: string;
+	toolCounts: Record<string, number>;
+}
+
+const TURN_BODY_MAX = 8000;
+
+export function buildTurnCard(
+	s: SessionState,
+	t: TurnSummary,
+): Record<string, unknown> {
+	const elements: Array<Record<string, unknown>> = [];
+
+	let body = t.assistantText;
+	let truncatedChars = 0;
+	if (body.length > TURN_BODY_MAX) {
+		truncatedChars = body.length - TURN_BODY_MAX;
+		body = body.slice(0, TURN_BODY_MAX);
+	}
+	if (body) elements.push({ tag: "markdown", content: body });
+	if (truncatedChars > 0) {
+		elements.push({
+			tag: "markdown",
+			content: `<font color='grey'>… (后续 ${truncatedChars} 字符已截断)</font>`,
+		});
+	}
+
+	const toolNames = Object.keys(t.toolCounts);
+	if (toolNames.length > 0) {
+		if (elements.length > 0) elements.push({ tag: "hr" });
+		const summary = toolNames
+			.sort((a, b) => (t.toolCounts[b] ?? 0) - (t.toolCounts[a] ?? 0))
+			.map((n) => `${n}·${t.toolCounts[n]}`)
+			.join(" · ");
+		elements.push({
+			tag: "markdown",
+			content: `<font color='grey'>🛠 ${summary}</font>`,
+		});
+	}
+
+	if (elements.length === 0) {
+		elements.push({ tag: "markdown", content: "_(空回合)_" });
+	}
+
+	return {
+		schema: "2.0",
+		config: { wide_screen_mode: true },
+		header: {
+			template: "turquoise",
+			title: {
+				tag: "plain_text",
+				content: `💬 ${s.projectName} · turn ${t.turnNumber}`,
+			},
+			subtitle: {
+				tag: "plain_text",
+				content: `${t.elapsedSec}s`,
+			},
+		},
+		body: { elements },
+	};
+}
+
 // ── Feishu send/update ──────────────────────────────
 
-async function sendOrUpdateCard(s: SessionState): Promise<void> {
+/**
+ * Create the per-session thread root message in the CC progress chat.
+ * Subsequent turn replies use `message.reply` to chain into the same thread,
+ * which Feishu renders as a topic when the chat has 话题模式 enabled.
+ */
+async function sendThreadRoot(s: SessionState): Promise<void> {
 	const client = getLarkClient();
 	const chatId = targetChatId();
-	if (!client) {
-		console.warn("[cc-progress] Lark client not initialized — skipping card");
+	if (!client || !chatId) {
+		if (!client)
+			console.warn("[cc-progress] Lark client not initialized — skipping root");
+		if (!chatId)
+			console.warn("[cc-progress] CC_PROGRESS_CHAT_ID not set — skipping root");
 		return;
 	}
-	if (!chatId) {
-		console.warn(
-			"[cc-progress] CC_PROGRESS_CHAT_ID / DAILY_REPORT_CHAT_ID not set — skipping card",
-		);
-		return;
-	}
+	if (s.threadRootMessageId) return;
 
 	const card = buildCard(s);
-	const content = JSON.stringify(card);
+	try {
+		const res = await client.im.v1.message.create({
+			params: { receive_id_type: "chat_id" },
+			data: {
+				receive_id: chatId,
+				msg_type: "interactive",
+				content: JSON.stringify(card),
+			},
+		});
+		const msgId = res?.data?.message_id;
+		if (msgId) {
+			s.threadRootMessageId = msgId;
+			s.feishuMessageId = msgId; // back-compat
+		}
+	} catch (err: any) {
+		console.error("[cc-progress] root create failed:", err?.message || err);
+	}
+}
 
-	if (!s.feishuMessageId) {
+/**
+ * Read the transcript delta for this session, build a turn card, and reply
+ * into the session's thread. Falls back to creating the root if it's missing
+ * (e.g., a session that never fired UserPromptSubmit).
+ */
+async function sendThreadReply(s: SessionState): Promise<void> {
+	const client = getLarkClient();
+	const chatId = targetChatId();
+	if (!client || !chatId) return;
+
+	if (!s.threadRootMessageId) {
+		await sendThreadRoot(s);
+		if (!s.threadRootMessageId) return;
+	}
+
+	let delta: TranscriptDelta = {
+		assistantText: "",
+		toolCounts: {},
+		newOffset: s.lastTranscriptOffset,
+	};
+	if (s.transcriptPath) {
 		try {
-			const res = await client.im.v1.message.create({
-				params: { receive_id_type: "chat_id" },
-				data: {
-					receive_id: chatId,
-					msg_type: "interactive",
-					content,
-				},
-			});
-			const msgId = res?.data?.message_id;
-			if (msgId) s.feishuMessageId = msgId;
+			delta = await parseTranscriptDelta(
+				s.transcriptPath,
+				s.lastTranscriptOffset,
+			);
 		} catch (err: any) {
-			console.error(
-				"[cc-progress] card create failed:",
+			console.warn(
+				"[cc-progress] transcript parse failed:",
 				err?.message || err,
 			);
 		}
-		return;
 	}
 
+	const elapsedSec = Math.max(
+		0,
+		Math.round((Date.now() - s.currentTurnStartedAt) / 1000),
+	);
+	const card = buildTurnCard(s, {
+		turnNumber: Math.max(1, s.turnNumber),
+		elapsedSec,
+		assistantText: delta.assistantText,
+		toolCounts: delta.toolCounts,
+	});
+
 	try {
-		await client.im.message.patch({
-			path: { message_id: s.feishuMessageId },
-			data: { content },
+		await client.im.v1.message.reply({
+			path: { message_id: s.threadRootMessageId! },
+			data: {
+				msg_type: "interactive",
+				content: JSON.stringify(card),
+				reply_in_thread: true,
+			},
 		});
+		s.lastTranscriptOffset = delta.newOffset;
 	} catch (err: any) {
-		console.error(
-			"[cc-progress] card patch failed:",
-			err?.message || err,
-		);
+		console.error("[cc-progress] turn reply failed:", err?.message || err);
 	}
 }
+
 
 // ── Event handler ───────────────────────────────────
 
@@ -208,13 +415,22 @@ export function applyEvent(payload: CCEventPayload): SessionState | null {
 	if (!payload?.session_id) return null;
 	const event = payload.hook_event_name || payload.hook_event;
 	const s = getOrCreate(payload.session_id, payload.cwd || "/");
-	s.lastEventAt = Date.now();
+	const now = Date.now();
+	s.lastEventAt = now;
+
+	// Always latch transcript_path the first time we see one — every hook
+	// payload carries it, but UserPromptSubmit is the most reliable.
+	if (payload.transcript_path && !s.transcriptPath) {
+		s.transcriptPath = payload.transcript_path;
+	}
 
 	switch (event) {
 		case "UserPromptSubmit":
 			if (payload.prompt) s.lastUserPrompt = payload.prompt;
 			s.status = "running";
 			s.toolCount = 0;
+			s.turnNumber++;
+			s.currentTurnStartedAt = now;
 			break;
 		case "PreToolUse":
 		case "PostToolUse":
@@ -230,11 +446,6 @@ export function applyEvent(payload: CCEventPayload): SessionState | null {
 			break;
 	}
 	return s;
-}
-
-function shouldEmitCard(event: CCHookEvent | undefined): boolean {
-	// Phase 1: only Stop drives the card update.
-	return event === "Stop";
 }
 
 // ── HTTP route ──────────────────────────────────────
@@ -255,10 +466,17 @@ export function registerCCProgressRoutes(app: Hono): void {
 		if (!state) return c.json({ error: "apply failed" }, 500);
 
 		const event = payload.hook_event_name || payload.hook_event;
-		if (shouldEmitCard(event)) {
-			// Fire-and-forget so the hook returns fast (<= 2s budget).
-			sendOrUpdateCard(state).catch((err) => {
-				console.error("[cc-progress] sendOrUpdateCard:", err);
+		// Fire-and-forget: hooks have a tight stdin/stdout budget on the CC
+		// side, so we MUST return before doing IO. UserPromptSubmit creates
+		// the per-session thread root the first time we see the session;
+		// Stop appends each turn's claude-output as a reply into that thread.
+		if (event === "UserPromptSubmit" && !state.threadRootMessageId) {
+			sendThreadRoot(state).catch((err) => {
+				console.error("[cc-progress] sendThreadRoot:", err);
+			});
+		} else if (event === "Stop") {
+			sendThreadReply(state).catch((err) => {
+				console.error("[cc-progress] sendThreadReply:", err);
 			});
 		}
 

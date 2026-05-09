@@ -1,8 +1,13 @@
 import { describe, test, expect, beforeEach } from "bun:test";
+import { writeFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import {
 	applyEvent,
 	buildCard,
+	buildTurnCard,
+	parseTranscriptDelta,
 	registerCCProgressRoutes,
 	_getSessionsForTest,
 	_resetSessionsForTest,
@@ -207,5 +212,184 @@ describe("cc-progress route", () => {
 			body: "not json",
 		});
 		expect(res.status).toBe(400);
+	});
+});
+
+describe("cc-progress parseTranscriptDelta", () => {
+	function writeFixture(lines: object[]): string {
+		const dir = mkdtempSync(join(tmpdir(), "cc-progress-"));
+		const path = join(dir, "transcript.jsonl");
+		writeFileSync(path, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+		return path;
+	}
+
+	test("extracts assistant text and tool counts, skipping thinking/tool_result", async () => {
+		const path = writeFixture([
+			{
+				type: "user",
+				message: { content: [{ type: "text", text: "hello" }] },
+			},
+			{
+				type: "assistant",
+				message: {
+					content: [
+						{ type: "thinking", thinking: "internal" },
+						{ type: "text", text: "Hi! Let me check." },
+						{ type: "tool_use", name: "Read", input: {} },
+					],
+				},
+			},
+			{
+				type: "user",
+				message: {
+					content: [{ type: "tool_result", content: "file contents" }],
+				},
+			},
+			{
+				type: "assistant",
+				message: {
+					content: [
+						{ type: "text", text: "Found it." },
+						{ type: "tool_use", name: "Bash", input: {} },
+						{ type: "tool_use", name: "Read", input: {} },
+					],
+				},
+			},
+		]);
+		const r = await parseTranscriptDelta(path, 0);
+		expect(r.assistantText).toContain("Hi! Let me check.");
+		expect(r.assistantText).toContain("Found it.");
+		expect(r.assistantText).not.toContain("internal");
+		expect(r.assistantText).not.toContain("file contents");
+		expect(r.toolCounts).toEqual({ Read: 2, Bash: 1 });
+		expect(r.newOffset).toBeGreaterThan(0);
+	});
+
+	test("incremental: starting from previous offset returns only new content", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "cc-progress-"));
+		const path = join(dir, "transcript.jsonl");
+		// First write
+		writeFileSync(
+			path,
+			JSON.stringify({
+				type: "assistant",
+				message: { content: [{ type: "text", text: "first" }] },
+			}) + "\n",
+		);
+		const r1 = await parseTranscriptDelta(path, 0);
+		expect(r1.assistantText).toContain("first");
+
+		// Append second turn
+		const append =
+			JSON.stringify({
+				type: "assistant",
+				message: { content: [{ type: "text", text: "second" }] },
+			}) + "\n";
+		writeFileSync(path, JSON.stringify({
+			type: "assistant",
+			message: { content: [{ type: "text", text: "first" }] },
+		}) + "\n" + append);
+		const r2 = await parseTranscriptDelta(path, r1.newOffset);
+		expect(r2.assistantText).toContain("second");
+		expect(r2.assistantText).not.toContain("first");
+	});
+
+	test("missing file returns empty result", async () => {
+		const r = await parseTranscriptDelta("/nonexistent/path", 0);
+		expect(r.assistantText).toBe("");
+		expect(r.toolCounts).toEqual({});
+		expect(r.newOffset).toBe(0);
+	});
+});
+
+describe("cc-progress buildTurnCard", () => {
+	beforeEach(() => {
+		_resetSessionsForTest();
+	});
+
+	test("includes assistant text and folded tool summary", () => {
+		const s = applyEvent({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "abcdef0123456789",
+			cwd: "/work/proj",
+			prompt: "do thing",
+		})!;
+		const card = buildTurnCard(s, {
+			turnNumber: 1,
+			elapsedSec: 42,
+			assistantText: "Hello, here is what I found.\n\nSome details.",
+			toolCounts: { Read: 3, Bash: 1, Edit: 2 },
+		}) as any;
+
+		expect(card.schema).toBe("2.0");
+		const md = card.body.elements
+			.map((e: any) => e.content || "")
+			.join("\n");
+		expect(md).toContain("Hello, here is what I found.");
+		expect(md).toContain("Some details.");
+		expect(md).toMatch(/Read.{0,3}3/); // "Read·3" or "Read×3"
+		expect(md).toContain("Bash");
+		expect(md).toContain("Edit");
+	});
+
+	test("no tool calls renders without tool footer", () => {
+		const s = applyEvent({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "s1",
+			cwd: "/x",
+			prompt: "p",
+		})!;
+		const card = buildTurnCard(s, {
+			turnNumber: 1,
+			elapsedSec: 5,
+			assistantText: "just talking",
+			toolCounts: {},
+		}) as any;
+		const md = card.body.elements
+			.map((e: any) => e.content || "")
+			.join("\n");
+		expect(md).toContain("just talking");
+		expect(md).not.toMatch(/工具|tools/i);
+	});
+
+	test("very long assistant text gets truncated with marker", () => {
+		const s = applyEvent({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "s2",
+			cwd: "/y",
+			prompt: "p",
+		})!;
+		const long = "x".repeat(10_000);
+		const card = buildTurnCard(s, {
+			turnNumber: 1,
+			elapsedSec: 1,
+			assistantText: long,
+			toolCounts: {},
+		}) as any;
+		const md = card.body.elements
+			.map((e: any) => e.content || "")
+			.join("\n");
+		expect(md.length).toBeLessThan(long.length);
+		expect(md).toMatch(/截断|truncated|…/);
+	});
+
+	test("empty assistant text falls back to placeholder", () => {
+		const s = applyEvent({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "s3",
+			cwd: "/z",
+			prompt: "p",
+		})!;
+		const card = buildTurnCard(s, {
+			turnNumber: 1,
+			elapsedSec: 1,
+			assistantText: "",
+			toolCounts: { Read: 1 },
+		}) as any;
+		const md = card.body.elements
+			.map((e: any) => e.content || "")
+			.join("\n");
+		// Should still render something (the tool summary at least)
+		expect(md).toContain("Read");
 	});
 });
