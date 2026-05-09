@@ -1,12 +1,24 @@
 import { spawn, type ChildProcess } from "child_process";
+import { isAbsolute, resolve } from "node:path";
 
 // ── Types ───────────────────────────────────────────
 
 // Default working directory for Claude CLI — contains CLAUDE.md, memory/, skills/
 const DEFAULT_AGENT_CWD = "./data";
 
-// Allow overriding the claude binary (e.g. with a wrapper that runs preflight checks)
-const CLAUDE_BIN = process.env.CCBUDDY_CLAUDE_BIN || "claude";
+// Allow overriding the claude binary (e.g. with a wrapper that runs preflight checks).
+// spawn() with the `cwd` option resolves a relative `command` against the *child's*
+// new cwd (./data), so "./scripts/claude-wrapper.sh" would be looked up inside
+// ./data and fail with ENOENT. Resolve to absolute against the daemon's startup CWD.
+const CLAUDE_BIN = (() => {
+  const raw = process.env.CCBUDDY_CLAUDE_BIN;
+  if (!raw) return "claude";
+  if (isAbsolute(raw)) return raw;
+  if (raw.startsWith("./") || raw.startsWith("../") || raw.includes("/")) {
+    return resolve(process.cwd(), raw);
+  }
+  return raw;
+})();
 
 export interface AgentOptions {
   sessionId: string;

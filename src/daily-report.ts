@@ -775,6 +775,21 @@ export async function runDailyReportOnce(opts: RunOptions): Promise<void> {
 			targetChatId,
 			`⚠️ AI 日报渲染失败（${date}）\n\n${err?.message || err}\n\n检查 ${outPath} 是否生成或格式是否正确。`,
 		);
+		// Persist failure so PM2 restarts + catchup polls don't re-spam the same alert.
+		// Re-alerts on this date are blocked until the JSON appears (manual /daily-report
+		// can still write it) or until tomorrow rolls over.
+		try {
+			const notified = await loadNotified();
+			if (!notified.has(date)) {
+				notified.add(date);
+				await saveNotified(notified);
+			}
+		} catch (persistErr) {
+			console.error(
+				"[daily-report] Failed to persist failure dedup:",
+				persistErr,
+			);
+		}
 		return;
 	}
 
@@ -1207,7 +1222,7 @@ export function initDailyReport(
 	console.log(`[daily-report] Scheduler active: "${schedule}" (${timezone})`);
 
 	const catchupGuard = new CatchupGuard();
-	const tryCatchup = (trigger: string) => {
+	const tryCatchup = async (trigger: string) => {
 		// Don't race the primary cron path — if an agent run is in flight, leave it alone.
 		if (isAgentRunning()) return;
 		const decision = isCatchupNeeded(schedule);
@@ -1219,6 +1234,23 @@ export function initDailyReport(
 				);
 			}
 			return;
+		}
+		// Cross-restart dedup: a prior run today already alerted the user about the
+		// failure. Don't burn another agent run + duplicate alert on every PM2 restart.
+		// Manual `/daily-report` still works (it bypasses this gate by going through
+		// runDailyReportOnce directly).
+		try {
+			const notified = await loadNotified();
+			if (notified.has(decision.date)) {
+				if (trigger !== "poll") {
+					console.log(
+						`[daily-report] Catchup (${trigger}): ${decision.date} already alerted (notified.json) — skip`,
+					);
+				}
+				return;
+			}
+		} catch (err) {
+			console.warn("[daily-report] Could not read notified.json:", err);
 		}
 		if (!catchupGuard.tryClaim(decision.date)) {
 			if (trigger !== "poll") {
